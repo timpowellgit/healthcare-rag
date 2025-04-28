@@ -15,7 +15,7 @@ import asyncio
 from itertools import chain  # (used later)
 import logging
 import time
-
+from pydantic.json_schema import SkipJsonSchema
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -62,6 +62,11 @@ class ClarifiedQuery(BaseModel):
 
         return self
     
+class FollowUpQuestions(BaseModel):
+    questions: List[str] = Field(
+        description="A list of 3 follow-up questions that would be natural to ask next based on the answer."
+    )
+    
 class DecomposedQuery(BaseModel):
     original_query: str
     query_complexity: Literal["simple", "complex"] = Field(description="The complexity of the original query.")
@@ -86,7 +91,7 @@ class QueryDocument(BaseModel):
     """Represents a single document retrieved from a vector store."""
     content: str
     relevance_score: float = Field(description="The relevance score provided by the similarity search.")
-    doc_id: Optional[str] = None
+    doc_id: str = Field(description="Unique identifier for this document chunk.")
     metadata: Optional[Dict[str, Any]] = None
 
 class QueryResult(BaseModel):
@@ -97,18 +102,12 @@ class QueryResult(BaseModel):
 class ErrorResult(BaseModel):
     error: str
 
-class AnswerResult(BaseModel):
-    answer: str
-    sources: List[str]
-    original_query: str
-    clarified_query: Optional[str]
 
 class ConversationEntry(BaseModel):
     """Represents a single entry in a conversation history."""
     timestamp: datetime
     user_query: str
     answer: str
-    sources: List[str]
 
 class DocumentRelevanceEvaluation(BaseModel):
     explanation: str = Field(description="Explanation of why the document is relevant or irrelevant to the query")
@@ -141,6 +140,24 @@ class RelevantHistoryContext(BaseModel):
             self.relevant_snippets = ""
         return self
     
+
+class Citation(BaseModel):
+    """Represents a citation for a particular statement in the answer."""
+    doc_id: str = Field(description="The unique identifier of the cited document.")
+    source_name: str = Field(description="The name of the source (e.g., 'Lipitor', 'Metformin').")
+    relevance: float = Field(description="How relevant this document is to the cited statement (0-1).")
+    
+class CitedStatement(BaseModel):
+    """A statement with its supporting citations."""
+    text: str = Field(description="The statement text.")
+    citations: List[Citation] = Field(description="Citations supporting this statement.")
+    is_supported: bool = Field(description="Whether this statement is supported by the documents.")
+    
+class CitedAnswerResult(BaseModel):
+    """A complete answer with structured citations."""
+    answer: str = Field(description="The complete answer text.")
+    cited_statements: List[CitedStatement] = Field(description="Statements with citations.")
+    follow_up_questions: SkipJsonSchema[Optional[List[str]]] = Field(description="Follow-up questions based on the answer.")
 
     
 class VectorStoreManager:
@@ -228,7 +245,7 @@ class QueryPreprocessor:
         """
         # If there's no conversation context, no need to clarify
         if not conversation_context:
-            return ClarifiedQuery(original_query=user_query, clarified_query=user_query)
+            return ClarifiedQuery(original_query=user_query, clarified_query=user_query, ambiguity_level="clear and specific")
             
         prompt = [
             {
@@ -313,7 +330,6 @@ class QueryPreprocessor:
             print(f"Error during query decomposition: {e}")
             return DecomposedQuery(original_query=user_query, query_complexity="simple", decomposed_query=user_query)
             
-    # -------------------------- NEW ASYNC HELPERS --------------------------
     @log_timing
     async def clarify_query_async(self, user_query: str, conversation_context: str = ""):
         logger.info(f"Clarifying query: '{user_query}'")
@@ -399,7 +415,7 @@ class ConversationHistory:
         os.makedirs(save_directory, exist_ok=True)
         self.conversations: Dict[str, List[ConversationEntry]] = {}
         
-    def add_entry(self, user_id: str, query: str, answer: str, sources: List[str]) -> None:
+    def add_entry(self, user_id: str, query: str, answer: str) -> None:
         """
         Add a new entry to a user's conversation history.
         
@@ -416,7 +432,6 @@ class ConversationHistory:
             timestamp=datetime.now(),
             user_query=query,
             answer=answer,
-            sources=sources
         )
         
         self.conversations[user_id].append(entry)
@@ -444,7 +459,6 @@ class ConversationHistory:
                 timestamp=entry.timestamp,
                 user_query=entry.user_query,
                 answer=entry.answer,
-                sources=entry.sources
             )
             for entry in history[-limit:][::-1]  # Most recent first
         ]
@@ -602,15 +616,26 @@ class QueryRouter:
                         
                         # Use similarity_search_with_score instead of similarity_search
                         search_results = store.similarity_search_with_score(query, k=3)
-                        query_docs = [
-                            QueryDocument(
-                                content=doc.page_content, 
-                                relevance_score=score,
-                                doc_id=doc.id,
-                                metadata=doc.metadata
+                        query_docs = []
+                        
+                        for i, (doc, score) in enumerate(search_results):
+                            # Extract ID from document metadata if available or generate one
+                            doc_id = None
+                            if hasattr(doc, 'metadata') and doc.metadata:
+                                doc_id = doc.metadata.get('id') or doc.metadata.get('_id')
+                            
+                            # If no ID found in metadata, generate one
+                            if not doc_id:
+                                doc_id = f"{store_name.lower()}_{i}_{uuid4()}"
+                                
+                            query_docs.append(
+                                QueryDocument(
+                                    content=doc.page_content, 
+                                    relevance_score=score,
+                                    doc_id=doc_id,
+                                    metadata=doc.metadata
+                                )
                             )
-                            for doc, score in search_results
-                        ]
                         results.append(QueryResult(source=store_name, query=query, docs=query_docs))
             else:
                 logger.warning("No relevant sources identified for query")
@@ -632,61 +657,133 @@ class AnswerGenerator:
             llm_model: Model name for the answer generation LLM
         """
         self.llm_model   = llm_model
-        self.client      = openai.OpenAI()         # legacy sync
         self.async_client = openai.AsyncOpenAI()   # new async
     
-    # ---------------- NEW async variant ----------------
+    # Update the generate_answer_async method to return cited answers
     @log_timing
     async def generate_answer_async(
         self,
         user_question: str,
         retrieval_results: List[QueryResult],
         conversation_context: str = "",
-    ) -> AnswerResult:
+    ) -> CitedAnswerResult:
+        """
+        Generates an answer with citations from retrieved documents.
+        
+        Args:
+            user_question: The user's question
+            retrieval_results: Retrieved documents from vector stores
+            conversation_context: Optional conversation history context
+            
+        Returns:
+            A CitedAnswerResult with the answer and structured citations
+        """
         if not retrieval_results:
-            return AnswerResult(
-                answer="I'm sorry, I couldn't find relevant information to answer your question.",
-                sources=[],
+            return CitedAnswerResult(
                 original_query=user_question,
-                clarified_query=None,
+                answer="I'm sorry, I couldn't find relevant information to answer your question.",
+                cited_statements=[
+                    CitedStatement(
+                        text="No relevant information found.",
+                        citations=[],
+                        is_supported=False
+                    )
+                ],
+                sources=[],
+                unsupported_info="The entire answer is unsupported as no relevant documents were found."
             )
 
-        combined_context = ""
-        sources = []
+        # Format documents with source name and ID for clear citation
+        formatted_docs = []
+        source_names = set()
+        
         for result in retrieval_results:
-            combined_context += "\n\n" + "\n\n".join(
-                doc.content for doc in result.docs
-            )
-            sources.append(result.source)
+            source_name = result.source
+            source_names.add(source_name)
+            
+            for doc in result.docs:
+                # Ensure each document has an ID
+                doc_id = doc.doc_id or f"doc_{len(formatted_docs)}"
+                
+                formatted_docs.append({
+                    "source": source_name,
+                    "id": doc_id,
+                    "content": doc.content,
+                    "relevance_score": doc.relevance_score
+                })
+        
+        doc_context = ""
+        for i, doc in enumerate(formatted_docs):
+            doc_context += f"[{doc['id']}] Source: {doc['source']}\n"
+            doc_context += f"Content: {doc['content']}\n\n"
 
-        system_content = (
-            f"You are a medical assistant. Use the following context about "
-            f"{', '.join(sources)} to answer the question."
-        )
+        system_content = """You are a medical assistant that generates answers with precise citations.
+
+For each statement or claim in your answer, you must cite the specific document(s) that support it.
+
+Your response must be structured with:
+1. A complete answer to the question
+2. A breakdown of statements with citations to specific document IDs
+3. A clear indication of which parts are supported by the documents and which aren't
+
+Follow these guidelines:
+- Use the document IDs in the format [ID] to cite sources
+- Don't make up information - if the documents don't contain needed information, state this clearly
+- Group similar information from multiple sources when possible
+- For each statement, determine if it's supported by the documents
+"""
+
         if conversation_context:
-            system_content += (
-                "\n\nRelevant conversation context:\n" + conversation_context
-            )
+            system_content += "\n\nHere is relevant conversation context you should consider:\n" + conversation_context
 
         rag_messages = [
             {"role": "system", "content": system_content},
             {
                 "role": "user",
-                "content": f"Context:\n{combined_context.strip()}\n\nQuestion: {user_question}",
-            },
+                "content": f"Documents:\n{doc_context}\n\nQuestion: {user_question}\n\nPlease provide a complete answer with citations to the specific document IDs that support each statement."
+            }
         ]
 
-        response = await self.async_client.chat.completions.create(
-            model=self.llm_model,
-            messages=rag_messages,
-        )
-        answer = response.choices[0].message.content
-        return AnswerResult(
-            answer=answer,
-            sources=sources,
-            original_query=user_question,
-            clarified_query=None,
-        )
+        logger.info(f"Generating cited answer for query: '{user_question}'")
+        try:
+            response = await self.async_client.beta.chat.completions.parse(
+                model=self.llm_model,
+                messages=rag_messages,
+                response_format=CitedAnswerResult,
+                temperature=0.0  # Low temperature for factual accuracy
+            )
+            
+            result = response.choices[0].message.parsed            
+            if result is None:
+                raise Exception("No result generated")
+            logger.info(f"Generated answer with {len(result.cited_statements)} cited statements")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error generating cited answer: {e}", exc_info=True)
+            # Fallback to basic answer without structured citations
+            sources = list(source_names)
+            
+            # Try to generate a basic answer without parsing
+            try:
+                basic_response = await self.async_client.chat.completions.create(
+                    model=self.llm_model,
+                    messages=rag_messages,
+                )
+                answer_text = basic_response.choices[0].message.content
+            except:
+                answer_text = "I'm sorry, I encountered an error generating an answer to your question."
+                
+            return CitedAnswerResult(
+                answer=answer_text,
+                cited_statements=[
+                    CitedStatement(
+                        text=answer_text,
+                        citations=[],
+                        is_supported=False
+                    )
+                ],
+            )
 
 class RetrievalEvaluator:
     """Evaluates if retrieved documents contain sufficient information to answer the query."""
@@ -782,7 +879,8 @@ class RetrievalEvaluator:
             )
             
             evaluation = response.choices[0].message.parsed
-            
+            if evaluation is None:
+                raise Exception("No evaluation generated")
             # Check if additional queries are needed
             if not evaluation.is_sufficient and evaluation.additional_queries:
                 logger.info(f"Retrieval insufficient. Missing info: {evaluation.missing_information}")
@@ -996,6 +1094,91 @@ class ConversationContextProcessor:
                 relevant_snippets=""
             )
 
+class FollowUpQuestionsGenerator:
+    """Generates follow-up questions based on the answer and conversation history."""
+    
+    def __init__(self, llm_model: str = "gpt-4o-mini"):
+        """
+        Initialize the follow-up questions generator.
+        
+        Args:
+            llm_model: Model name for the LLM
+        """
+        self.llm_model = llm_model
+        self.client = openai.OpenAI()
+        self.async_client = openai.AsyncOpenAI()
+    
+    @log_timing
+    async def generate_follow_up_questions(
+        self, 
+        query: str, 
+        answer: str, 
+        conversation_history: Optional[List[ConversationEntry]] = None
+    ) -> FollowUpQuestions:
+        """
+        Generate three potential follow-up questions that a user might ask based on the answer 
+        and conversation history.
+        
+        Args:
+            query: The original user query
+            answer: The answer provided to the user
+            conversation_history: Optional list of previous conversation entries
+            
+        Returns:
+            A FollowUpQuestions object containing a list of 3 follow-up questions
+        """
+        logger.info(f"Generating follow-up questions for query: '{query}'")
+        
+        # Format conversation history if provided
+        history_context = ""
+        if conversation_history and len(conversation_history) > 0:
+            history_context = "Previous conversation:\n"
+            for i, entry in enumerate(conversation_history):
+                history_context += f"User: {entry.user_query}\n"
+                history_context += f"Assistant: {entry.answer}\n\n"
+            logger.debug(f"Using {len(conversation_history)} conversation entries for context")
+        
+        system_content = """You are an AI assistant that generates natural follow-up questions a user might ask after receiving an answer.
+        Generate exactly 3 distinct follow-up questions that:
+        1. Ask for more detail about information mentioned in the answer
+        2. Explore related topics that might be of interest
+        3. Clarify or compare aspects mentioned in the answer
+        
+        Consider the conversation history if provided to avoid suggesting questions that have already been asked.
+        The questions should be clear, concise, and directly related to the medical topic discussed.
+        """
+        
+        user_content = f"Original question: {query}\n\nAnswer: {answer}"
+        if history_context:
+            user_content = f"{history_context}\n{user_content}"
+        user_content += "\n\nSuggest three natural follow-up questions:"
+        
+        prompt = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content}
+        ]
+        
+        try:
+            response = await self.async_client.beta.chat.completions.parse(
+                model=self.llm_model,
+                messages=prompt,
+                temperature=0.3,  # Higher temperature for more variety
+                response_format=FollowUpQuestions
+            )
+            
+            result = response.choices[0].message.parsed
+            logger.info(f"Generated {len(result.questions)} follow-up questions")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error generating follow-up questions: {e}", exc_info=True)
+            # Return default questions if generation fails
+            return FollowUpQuestions(questions=[
+                "What are the most common side effects?",
+                "Are there any alternatives to this medication?",
+                "How long should I take this medication?"
+            ])
+
 class MedicalRAG:
     """
     A medical RAG system that integrates vector stores, query routing, answer generation,
@@ -1010,6 +1193,7 @@ class MedicalRAG:
         preprocessor_model: str = "gpt-4o-mini",
         evaluator_model: str = "gpt-4o-mini",
         context_processor_model: str = "gpt-4o-mini",
+        follow_up_generator_model: str = "gpt-4o-mini",
         conversation_history_dir: str = "data/conversations"
     ):
         """
@@ -1022,6 +1206,7 @@ class MedicalRAG:
             preprocessor_model: Model for query preprocessing/clarification
             evaluator_model: Model for retrieval evaluation
             context_processor_model: Model for conversation context processing
+            follow_up_generator_model: Model for generating follow-up questions
             conversation_history_dir: Directory to store conversation histories
         """
         self.router = QueryRouter(vector_stores, router_model)
@@ -1029,6 +1214,7 @@ class MedicalRAG:
         self.preprocessor = QueryPreprocessor(preprocessor_model)
         self.evaluator = RetrievalEvaluator(evaluator_model)
         self.context_processor = ConversationContextProcessor(context_processor_model)
+        self.follow_up_generator = FollowUpQuestionsGenerator(follow_up_generator_model)
         self.conversation_history = ConversationHistory(conversation_history_dir)
     
     
@@ -1051,6 +1237,9 @@ class MedicalRAG:
         """Processes a user query using an optimistic approach with early answers and refinement."""
         logger.info(f"Processing query optimistically for user '{user_id}': '{user_query}'")
         logger.info(f"History enabled: {use_history}")
+        
+        # Store the current user_id for use in other methods
+        self._current_user_id = user_id
         
         overall_start = time.time()
         history = self.conversation_history.get_history(user_id) if use_history else []
@@ -1090,8 +1279,6 @@ class MedicalRAG:
             
             # Phase 7: Update history and return final answer
             if refined_answer.answer != fast_answer.answer:
-                if final_query != user_query:
-                    refined_answer.clarified_query = final_query
                 logger.info("YIELDING REFINED ANSWER")
                 yield refined_answer
             else:
@@ -1099,9 +1286,12 @@ class MedicalRAG:
             
             # Save to history
             self.conversation_history.add_entry(
-                user_id, user_query, refined_answer.answer, refined_answer.sources
+                user_id, user_query, refined_answer.answer,
             )
             logger.info("Conversation history updated")
+            
+            # Clear the current user_id
+            self._current_user_id = None
             
             # Log total processing time
             total_time = time.time() - overall_start
@@ -1277,9 +1467,26 @@ class MedicalRAG:
             final_query, filtered_results, ctx_result_obj.relevant_snippets
         )
         logger.info(f"Refined answer generated")
+        
+        # Get conversation history for follow-up question generation
+        user_id = getattr(self, '_current_user_id', None)
+        history = []
+        if user_id:
+            history = self.conversation_history.get_history(user_id)
+        
+        # Generate follow-up questions
+        logger.info("Generating follow-up questions")
+        follow_up_questions = await self.follow_up_generator.generate_follow_up_questions(
+            final_query, refined_answer.answer, history
+        )
+        logger.info(f"Generated follow-up questions: {follow_up_questions.questions}")
+        
+        # Add follow-up questions to the refined answer
+        refined_answer.follow_up_questions = follow_up_questions.questions
+        
         return refined_answer
     
-    def process_query_all_answers(self, user_id: str, user_query: str, use_history: bool = True) -> List[AnswerResult]:
+    def process_query_all_answers(self, user_id: str, user_query: str, use_history: bool = True) -> List[CitedAnswerResult]:
         """Get a list of all answers (fast and refined) from the query"""
         logger.info(f"Collecting all answers for query: '{user_query}'")
         
