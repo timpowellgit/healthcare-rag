@@ -19,7 +19,8 @@
     If no parts of the conversation history are relevant to the current query, return False and an empty formatted context.
 - role: user
   content: |
-    Current query: {{ current_query }}
+    Current query: 
+    {{ current_query | indent(4) }}
 
     Previous conversation:
     |

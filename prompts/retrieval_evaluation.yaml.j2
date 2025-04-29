@@ -16,14 +16,17 @@
     Be thorough in your analysis and ensure all aspects of the query can be answered.
 - role: user
   content: |
-    Original Query: {{ original_query }}
-    Clarified Query: {{ clarified_query }}
+    Original Query: 
+    {{ original_query | indent(4) }}
+    
+    Clarified Query: 
+    {{ clarified_query | indent(4) }}
     
     Retrieved Information:
     |
 {{ retrieved_information | indent(width=4, first=True) }}
     
-    Sources: {{ sources }}
+    Sources: {{ sources | indent(4) }}
     
     Evaluate if this information is sufficient to fully answer the query.
     If not, specify what information is missing and suggest additional queries to retrieve it. 

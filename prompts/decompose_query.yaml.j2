@@ -12,6 +12,7 @@
     Return the original query, the complexity, and the decomposed queries.
 - role: user
   content: |
-    User query: {{ user_query }}
+    User query: 
+    {{ user_query | indent(4) }}
 
     Decomposed query: 

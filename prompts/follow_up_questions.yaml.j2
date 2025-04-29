@@ -10,12 +10,16 @@
     The questions should be clear, concise, and directly related to the medical topic discussed.
 
 - role: user
-  content: |+
+  content: |
     {% if history_context %}
-    {{ history_context }}
+    Previous conversation:
+    {{ history_context | indent(4) }}
     {% endif %}
-    Original question: {{ original_query }}
+    
+    Original question: 
+    {{ original_query | indent(4) }}
 
-    Answer: {{ answer }}
+    Answer: 
+    {{ answer | indent(4) }}
 
     Suggest three natural follow-up questions: 

@@ -18,7 +18,7 @@
     {% if conversation_context %}
 
     Here is relevant conversation context you should consider:
-    {{ conversation_context }}
+    {{ conversation_context | indent(4) }}
     {% endif %}
 - role: user
   content: |
@@ -26,6 +26,7 @@
     |
 {{ doc_context | indent(width=4, first=True) }}
 
-    Question: {{ user_question }}
+    Question: 
+    {{ user_question | indent(4) }}
 
     Please provide a complete answer with citations to the specific document IDs that support each statement. 

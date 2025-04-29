@@ -15,8 +15,9 @@
 - role: user
   content: |
     Previous conversation:
-    {{ conversation_context }}
+    {{ conversation_context | indent(4) }}
 
-    User query: {{ user_query }}
+    User query: 
+    {{ user_query | indent(4) }}
 
     Clarified query: 
