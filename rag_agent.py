@@ -1,7 +1,17 @@
 from langchain.embeddings import OpenAIEmbeddings
 from uuid import uuid4
 import json
-from typing import Dict, List, Union, Any, Optional, TypedDict, Tuple, NamedTuple, Literal
+from typing import (
+    Dict,
+    List,
+    Union,
+    Any,
+    Optional,
+    TypedDict,
+    Tuple,
+    NamedTuple,
+    Literal,
+)
 from datetime import datetime
 from langchain_core.documents import Document
 import faiss
@@ -9,20 +19,28 @@ from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
 import os
 import openai
+from openai.types.chat import ChatCompletionMessageParam
+
 from pydantic import BaseModel, model_validator, Field
-from typing import Self
+from typing import Self, Type, TypeVar
 import asyncio
 from itertools import chain  # (used later)
 import logging
 import time
 from pydantic.json_schema import SkipJsonSchema
+from fuzzywuzzy import fuzz
+import yaml
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from pathlib import Path
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("MedicalRAG")
+
 
 # Custom timing decorator for instrumentation
 def log_timing(func):
@@ -32,72 +50,162 @@ def log_timing(func):
         elapsed = time.time() - start_time
         logger.info(f"{func.__name__} completed in {elapsed:.2f}s")
         return result
-    
+
     async def async_wrapper(*args, **kwargs):
         start_time = time.time()
         result = await func(*args, **kwargs)
         elapsed = time.time() - start_time
         logger.info(f"{func.__name__} completed in {elapsed:.2f}s")
         return result
-    
+
     if asyncio.iscoroutinefunction(func):
         return async_wrapper
     else:
         return wrapper
 
+
 # Type definitions
+ResponseModel = TypeVar("ResponseModel", bound=BaseModel)
+
+
+# Type definitions
+class LLMParserService:
+    """Handles making calls to and parsing responses from OpenAI chat completions."""
+
+    def __init__(self, async_client: openai.AsyncOpenAI):
+        self.async_client = async_client
+
+    @log_timing
+    async def parse_completion(
+        self,
+        *,  # Force keyword arguments
+        model: str,
+        messages: List[ChatCompletionMessageParam],
+        response_format: Type[ResponseModel],
+        temperature: float,
+        default_response: Optional[ResponseModel] = None,
+    ) -> Optional[ResponseModel]:
+        """
+        Calls the OpenAI API using the beta parse helper and handles errors.
+
+        Args:
+            model: The model name to use.
+            messages: The list of messages for the prompt.
+            response_format: The Pydantic model class for parsing the response.
+            temperature: The sampling temperature.
+            default_response: The default value to return on failure or if parsing yields None.
+
+        Returns:
+            The parsed Pydantic model instance or the default_response.
+        """
+        format_name = getattr(response_format, "__name__", str(response_format))
+
+        try:
+            # Use fully qualified name for logging if it's a Pydantic model
+            logger.debug(
+                f"Calling LLM (model={model}, temp={temperature}, response_format={format_name})"
+            )
+
+            # The .parse() method directly returns the parsed Pydantic model or None
+            response = await self.async_client.beta.chat.completions.parse(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                response_format=response_format,
+            )
+            parsed_response = response.choices[0].message.parsed
+
+            if parsed_response is None:
+                logger.warning(
+                    f"LLM response parsing returned None for {format_name}. Returning default."
+                )
+                return default_response
+
+            return parsed_response
+        except Exception as e:
+            logger.error(f"Error during LLM call ({format_name}): {e}", exc_info=True)
+            return default_response
+
 
 class ClarifiedQuery(BaseModel):
     original_query: str
-    ambiguity_level: Literal["clear and specific", "medium ambiguity", "high ambiguity"] = Field(
-        description="The level of ambiguity in the original query.")
+    ambiguity_level: Literal[
+        "clear and specific", "medium ambiguity", "high ambiguity"
+    ] = Field(description="The level of ambiguity in the original query.")
     clarified_query: str = Field(
-        description="The clarified query that resolves the ambiguity. If there is nothing to clarify, just return the original query.")
+        description="The clarified query that resolves the ambiguity. If there is nothing to clarify, just return the original query."
+    )
 
     @model_validator(mode="after")
-    def check_clarified_query(self)-> Self:
-        if self.ambiguity_level == "clear and specific" and self.clarified_query != self.original_query:
+    def check_clarified_query(self) -> Self:
+        if (
+            self.ambiguity_level == "clear and specific"
+            and self.clarified_query != self.original_query
+        ):
             self.clarified_query = self.original_query
-        # TODO:: retrieve hitory here to verify the citation is correct 
-
         return self
-    
+
+
 class FollowUpQuestions(BaseModel):
     questions: List[str] = Field(
         description="A list of 3 follow-up questions that would be natural to ask next based on the answer."
     )
-    
+
+
 class DecomposedQuery(BaseModel):
     original_query: str
-    query_complexity: Literal["simple", "complex"] = Field(description="The complexity of the original query.")
-    decomposed_query: Optional[List[str]] = Field(description="The original query decomposed into subqueries." 
-                                                  "Only meant for unpacking complex queries. If there is nothing to decompose," 
-                                                  "just return the original query.")
+    query_complexity: Literal["simple", "complex"] = Field(
+        description="The complexity of the original query."
+    )
+    decomposed_query: Optional[List[str]] = Field(
+        description="The original query decomposed into subqueries."
+        "Only meant for unpacking complex queries. If there is nothing to decompose,"
+        "just return the original query."
+    )
 
     @model_validator(mode="after")
-    def check_decomposed_query(self)-> Self:
-        if self.query_complexity == "simple" and self.decomposed_query != self.original_query:
+    def check_decomposed_query(self) -> Self:
+        if (
+            self.query_complexity == "simple"
+            and self.decomposed_query != self.original_query
+        ):
             self.decomposed_query = [self.original_query]
         return self
-    
-    
+
+
 class RetrievalEvaluation(BaseModel):
-    is_sufficient: bool = Field(description="Whether the retrieved information is sufficient to answer the query")
-    missing_information: Optional[str] = Field(None, description="Description of information that's missing from the retrieved documents")
-    additional_queries: Optional[List[str]] = Field(None, description="List of suggested follow-up queries to retrieve missing information")
+    is_sufficient: bool = Field(
+        description="Whether the retrieved information is sufficient to answer the query"
+    )
+    missing_information: Optional[str] = Field(
+        None,
+        description="Description of information that's missing from the retrieved documents",
+    )
+    additional_queries: Optional[List[str]] = Field(
+        None,
+        description="List of suggested follow-up queries to retrieve missing information",
+    )
 
 
 class QueryDocument(BaseModel):
     """Represents a single document retrieved from a vector store."""
+
     content: str
-    relevance_score: float = Field(description="The relevance score provided by the similarity search.")
+    relevance_score: float = Field(
+        description="The relevance score provided by the similarity search."
+    )
     doc_id: str = Field(description="Unique identifier for this document chunk.")
+    source_name: str = Field(
+        description="The name of the source (e.g., 'Lipitor', 'Metformin')."
+    )
     metadata: Optional[Dict[str, Any]] = None
+
 
 class QueryResult(BaseModel):
     source: str
     query: str
     docs: List[QueryDocument]
+
 
 class ErrorResult(BaseModel):
     error: str
@@ -105,92 +213,116 @@ class ErrorResult(BaseModel):
 
 class ConversationEntry(BaseModel):
     """Represents a single entry in a conversation history."""
+
     timestamp: datetime
     user_query: str
     answer: str
 
+
 class DocumentRelevanceEvaluation(BaseModel):
-    explanation: str = Field(description="Explanation of why the document is relevant or irrelevant to the query")
-    is_relevant: bool = Field(description="Whether the document contains any information relevant whatsoever to answering the query")
+    explanation: str = Field(
+        description="Explanation of why the document is relevant or irrelevant to the query"
+    )
+    is_relevant: bool = Field(
+        description="Whether the document contains any information relevant whatsoever to answering the query"
+    )
 
 
 # Add this new Pydantic model for context extraction
 class RelevantHistoryContext(BaseModel):
     explanation: str = Field(
         description="Explanation of why any of the previous conversation entries "
-                   "are needed to answer the current query. If none of the previous "
-                   "conversation entries are needed to answer the current query, "
-                   "return an empty string."
+        "are needed to answer the current query. If none of the previous "
+        "conversation entries are needed to answer the current query, "
+        "return an empty string."
     )
     required_context: bool = Field(
         description="Whether the context is required to answer the query. "
-                   "If none of the previous conversation entries are needed "
-                   "to answer the current query, return False."
+        "If none of the previous conversation entries are needed "
+        "to answer the current query, return False."
     )
 
     relevant_snippets: Optional[str] = Field(
         description="Formatted context string ready to be used in the answer "
-                   "generation prompt. If none of the previous conversation entries "
-                   "are needed to answer the current query, return an empty string."
+        "generation prompt. If none of the previous conversation entries "
+        "are needed to answer the current query, return an empty string."
     )
 
     @model_validator(mode="after")
-    def check_relevant_snippets(self)-> Self:
+    def check_relevant_snippets(self) -> Self:
         if self.required_context == False:
             self.relevant_snippets = ""
         return self
-    
+
 
 class Citation(BaseModel):
     """Represents a citation for a particular statement in the answer."""
+
     doc_id: str = Field(description="The unique identifier of the cited document.")
-    source_name: str = Field(description="The name of the source (e.g., 'Lipitor', 'Metformin').")
-    relevance: float = Field(description="How relevant this document is to the cited statement (0-1).")
-    
-class CitedStatement(BaseModel):
+    source_name: str = Field(
+        description="The name of the source (e.g., 'Lipitor', 'Metformin')."
+    )
+    quote: str = Field(
+        description="The verbatim quote from the document that supports the statement."
+    )
+
+
+class StatementWithCitations(BaseModel):
     """A statement with its supporting citations."""
-    text: str = Field(description="The statement text.")
-    citations: List[Citation] = Field(description="Citations supporting this statement.")
-    is_supported: bool = Field(description="Whether this statement is supported by the documents.")
-    
+
+    text: str = Field(
+        description="The statement text. Can be a single sentence or a paragraph."
+    )
+    citations: List[Citation] = Field(
+        description="Citations supporting this statement."
+    )
+
+
 class CitedAnswerResult(BaseModel):
     """A complete answer with structured citations."""
-    answer: str = Field(description="The complete answer text.")
-    cited_statements: List[CitedStatement] = Field(description="Statements with citations.")
-    follow_up_questions: SkipJsonSchema[Optional[List[str]]] = Field(description="Follow-up questions based on the answer.")
 
-    
+    statements: List[StatementWithCitations] = Field(
+        description="List of statements to answer the query, each with its supporting citations."
+    )
+
+
 class VectorStoreManager:
     """Manages loading and creation of vector stores."""
-    
+
     def __init__(self, embedding_model: str = "text-embedding-3-large"):
         """
         Initialize the vector store manager.
-        
+
         Args:
             embedding_model: Model name for embeddings
         """
         self.embeddings = OpenAIEmbeddings(model=embedding_model)
-        
-    def load_or_create_store(self, save_path: str, data_path: Optional[str] = None) -> FAISS:
+
+    def load_or_create_store(
+        self, save_path: str, data_path: Optional[str] = None
+    ) -> FAISS:
         """
         Load an existing vector store or create a new one if it doesn't exist.
-        
+
         Args:
             save_path: Path to save/load the FAISS index
             data_path: Path to the source data JSON for creation (optional)
-            
+
         Returns:
             A FAISS vector store
         """
         if os.path.exists(save_path):
-            print(f"Loading existing index from {save_path}")
-            return FAISS.load_local(save_path, self.embeddings, allow_dangerous_deserialization=True)
+            logger.info(f"Loading existing index from {save_path}")
+            return FAISS.load_local(
+                save_path, self.embeddings, allow_dangerous_deserialization=True
+            )
         else:
             if not data_path:
-                raise ValueError("Data path must be provided to create a new vector store")
-                
-            print(f"Creating new index at {save_path}")
+                raise ValueError(
+                    "Data path must be provided to create a new vector store"
+                )
+
+            logger.info(f"Creating new index at {save_path}")
             # Create initial index structure
             index = faiss.IndexFlatL2(len(self.embeddings.embed_query("test")))
             vector_store = FAISS(
@@ -199,226 +331,153 @@ class VectorStoreManager:
                 docstore=InMemoryDocstore(),
                 index_to_docstore_id={},
             )
-            
+
             # Load and process chunks
             chunks = json.load(open(data_path))
-            docs = [Document(page_content=chunk["contextualized"], metadata=chunk["metadata"]) 
-                   for chunk in chunks]
+            docs = [
+                Document(
+                    page_content=chunk["contextualized"], metadata=chunk["metadata"]
+                )
+                for chunk in chunks
+            ]
             uuids = [str(uuid4()) for _ in range(len(docs))]
-            
+
             # Add documents and save
             vector_store.add_documents(documents=docs, ids=uuids)
             vector_store.save_local(save_path)
-            print(f"Index saved to {save_path}")
-            
+            logger.info(f"Index saved to {save_path}")
+
             return vector_store
 
-class QueryPreprocessor:
+
+class PromptManager:
+    """
+    Loads Jinja templates from a directory, renders them with context,
+    and returns a list of OpenAI chat message dicts.
+    """
+
+    def __init__(self, templates_dir: str | Path = "prompts"):
+        self.env = Environment(
+            loader=FileSystemLoader(templates_dir),
+            autoescape=select_autoescape(enabled_extensions=("j2",)),
+        )
+        # Cache compiled templates
+        self._cache = {}
+
+    def _get_template(self, name: str):
+        if name not in self._cache:
+            template_path = f"{name}.yaml.j2"
+            self._cache[name] = self.env.get_template(template_path)
+        return self._cache[name]
+
+    def messages(self, name: str, **context) -> List[ChatCompletionMessageParam]:
+        """
+        Render a template file and return a list of messages.
+        """
+        raw = self._get_template(name).render(**context)
+        return yaml.safe_load(raw)
+
+
+class BaseProcessor:
+    """Base class for all LLM-based processors to reduce code duplication."""
+    
+    def __init__(
+        self,
+        llm_model: str = "gpt-4o-mini",
+        async_client: openai.AsyncOpenAI = openai.AsyncOpenAI(),
+        prompt_manager: Optional[PromptManager] = None,
+        parser_service: Optional[LLMParserService] = None,
+    ):
+        self.llm_model = llm_model
+        self.async_client = async_client
+        self.pm = prompt_manager or PromptManager()
+        self.parser_service = parser_service or LLMParserService(async_client)
+    
+    async def _call_llm(
+        self,
+        prompt_name: str,
+        temperature: float = 0.1,
+        response_format: Type[ResponseModel] = Any,
+        default_response: Optional[ResponseModel] = None,
+        **prompt_args
+    ) -> Optional[ResponseModel]:
+        """Standardized method for LLM calls using prompt templates."""
+        messages = self.pm.messages(prompt_name, **prompt_args)
+        return await self.parser_service.parse_completion(
+            model=self.llm_model,
+            messages=messages,
+            temperature=temperature,
+            response_format=response_format,
+            default_response=default_response,
+        )
+
+
+class QueryPreprocessor(BaseProcessor):
     """
     Preprocesses user queries to resolve ambiguities using conversation history.
     Detects and clarifies ambiguous references like "it", "they", "this side effect", etc.
     """
-    
-    def __init__(self, llm_model: str = "gpt-4o-mini"):
-        """
-        Initialize the query preprocessor.
-        
-        Args:
-            llm_model: Model name for the clarification LLM
-        """
-        self.llm_model = llm_model
-        # sync client kept only for legacy methods
-        self.client       = openai.OpenAI()      
-        # async client for new coroutine helpers
-        self.async_client = openai.AsyncOpenAI()
-        
-    def clarify_query(self, user_query: str, conversation_context: str = "") -> ClarifiedQuery:
-        """
-        Clarify an ambiguous query by expanding references based on conversation history.
-        
-        Args:
-            user_query: The raw user query which may contain ambiguous references
-            conversation_context: Recent conversation history for context
-            
-        Returns:
-            Dictionary with original and clarified queries
-        """
-        # If there's no conversation context, no need to clarify
-        if not conversation_context:
-            return ClarifiedQuery(original_query=user_query, clarified_query=user_query, ambiguity_level="clear and specific")
-            
-        prompt = [
-            {
-                "role": "system", 
-                "content": """You are an AI assistant that clarifies ambiguous medical queries.
-                Your task is to rewrite potentially ambiguous queries to be more explicit and specific,
-                especially when they contain pronouns or implicit references to previous conversation.
-                
-                For example:
-                - "What are its side effects?" → "What are Lipitor's side effects?"
-                - "Is it safe during pregnancy?" → "Is metformin safe during pregnancy?"
-                - "Are any of these serious?" → "Are any of the side effects of Lipitor serious?"
-                
-                Only rewrite if needed - if the query is already clear and specific, leave it unchanged.
-                Return the original query, the clarified query, and the level of ambiguity."""
-            },
-            {
-                "role": "user", 
-                "content": f"Previous conversation:\n{conversation_context}\n\nUser query: {user_query}\n\nClarified query:"
-            }
-        ]
-        
-        try:
-            response = self.client.beta.chat.completions.parse(
-                model=self.llm_model,
-                messages=prompt,
-                temperature=0.1,
-                response_format=ClarifiedQuery
-            )
-            
-            clarified_query = response.choices[0].message.parsed
-            print(f"Clarified query: {clarified_query}")
-            return clarified_query
-            
-        except Exception as e:
-            print(f"Error during query clarification: {e}")
-            # If clarification fails, fall back to the original query
-            return ClarifiedQuery(original_query=user_query, ambiguity_level="medium ambiguity", explanation="", clarified_query=user_query, clarification="", citation="")
-        
-    def decompose_query(self, user_query: str) -> DecomposedQuery:
-        """
-        Decompose a complex query into simpler subqueries.
-        
-        Args:
-            user_query: The raw user query which may contain complex references
-            
-        Returns:
-            DecomposedQuery object containing original query, query complexity, and decomposed queries
-        """
-        prompt = [
-            {
-                "role": "system", 
-                "content": """You are an AI assistant that decomposes complex medical queries into simpler subqueries.
-                
-                For example:
-                - "Compare the side effects of Lipitor and Crestor and tell me which one is safer for elderly patients with kidney problems?" → ["What are the side effects of Lipitor?", "What are the side effects of Crestor?", "How do Lipitor and Crestor affect elderly patients?", "How do Lipitor and Crestor affect patients with kidney problems?"]
-                - "What's the recommended dosage of metformin for type 2 diabetes, and how should it be adjusted for patients with liver disease?" → ["What is the recommended dosage of metformin for type 2 diabetes?", "How should metformin dosage be adjusted for patients with liver disease?"]
-                - "Can you explain how ACE inhibitors work to lower blood pressure and what their long-term effects are on kidney function and cardiovascular health?" → ["How do ACE inhibitors work to lower blood pressure?", "What are the long-term effects of ACE inhibitors on kidney function?", "What are the long-term effects of ACE inhibitors on cardiovascular health?"]
-    
-                Only decompose if needed - if the query is already simple, leave it unchanged.
-                Return the original query, the complexity, and the decomposed queries."""
-            },
-            {
-                "role": "user", 
-                "content": f"User query: {user_query}\n\nDecomposed query:" 
-            }
-        ]
-        
-        try:
-            response = self.client.beta.chat.completions.parse(
-                model=self.llm_model,
-                messages=prompt,
-                temperature=0.1,
-                response_format=DecomposedQuery
-            )
-            
-            decomposed_query = response.choices[0].message.parsed
-            print(f"Decomposed query: {decomposed_query}")
-            return decomposed_query     
-        
-        except Exception as e:
-            print(f"Error during query decomposition: {e}")
-            return DecomposedQuery(original_query=user_query, query_complexity="simple", decomposed_query=user_query)
-            
+
     @log_timing
-    async def clarify_query_async(self, user_query: str, conversation_context: str = ""):
+    async def clarify_query_async(
+        self, user_query: str, conversation_context: str = ""
+    ):
         logger.info(f"Clarifying query: '{user_query}'")
 
-        # If there is no context, no need to hit the LLM
         if not conversation_context:
             logger.debug("No conversation context, skipping clarification")
-            return ClarifiedQuery(original_query=user_query, clarified_query=user_query, ambiguity_level="clear and specific")
-        
-        prompt = [
-            {
-                "role": "system",
-                "content": """You are an AI assistant that clarifies ambiguous medical queries.
-                Only rewrite when necessary. Return the original query, the clarified query,
-                and the level of ambiguity.""",
-            },
-            {
-                "role": "user",
-                "content": f"Previous conversation:\n{conversation_context}\n\n"
-                           f"User query: {user_query}\n\nClarified query:",
-            },
-        ]
+            return ClarifiedQuery(
+                original_query=user_query,
+                clarified_query=user_query,
+                ambiguity_level="clear and specific",
+            )
 
-        response = await self.async_client.beta.chat.completions.parse(
-            model=self.llm_model,
-            messages=prompt,
-            temperature=0.1,
+        return await self._call_llm(
+            prompt_name="clarify_query",
+            user_query=user_query,
+            conversation_context=conversation_context,
             response_format=ClarifiedQuery,
+            default_response=ClarifiedQuery(
+                original_query=user_query,
+                clarified_query=user_query,
+                ambiguity_level="clear and specific",
+            ),
         )
-        result = response.choices[0].message.parsed
-
-        if result.clarified_query != user_query:
-            logger.info(f"Query clarified: '{user_query}' → '{result.clarified_query}'")
-        else:
-            logger.info(f"Query unchanged after clarification check")
-        
-        return result
 
     @log_timing
     async def decompose_query_async(self, user_query: str):
         logger.info(f"Decomposing query: '{user_query}'")
 
-        prompt = [
-            {
-                "role": "system",
-                "content": """You are an AI assistant that decomposes complex medical
-                queries into simpler sub-queries. Only decompose when necessary.""",
-            },
-            {
-                "role": "user",
-                "content": f"User query: {user_query}\n\nDecomposed query:",
-            },
-        ]
-
-        response = await self.async_client.beta.chat.completions.parse(
-            model=self.llm_model,
-            messages=prompt,
-            temperature=0.1,
+        return await self._call_llm(
+            prompt_name="decompose_query",
+            user_query=user_query,
             response_format=DecomposedQuery,
+            default_response=DecomposedQuery(
+                original_query=user_query,
+                query_complexity="simple",
+                decomposed_query=[user_query],
+            ),
         )
-        result = response.choices[0].message.parsed
 
-        if result.query_complexity == "complex":
-            logger.info(f"Query decomposed into {len(result.decomposed_query)} sub-queries")
-            for i, subq in enumerate(result.decomposed_query):
-                logger.debug(f"  Sub-query {i+1}: '{subq}'")
-        else:
-            logger.info(f"Query classified as simple, no decomposition needed")
-        
-        return result
 
 class ConversationHistory:
     """Manages conversation history for users."""
-    
+
     def __init__(self, save_directory: str = "data/conversations"):
         """
         Initialize the conversation history manager.
-        
+
         Args:
             save_directory: Directory to save conversation histories
         """
         self.save_directory = save_directory
         os.makedirs(save_directory, exist_ok=True)
         self.conversations: Dict[str, List[ConversationEntry]] = {}
-        
+
     def add_entry(self, user_id: str, query: str, answer: str) -> None:
         """
         Add a new entry to a user's conversation history.
-        
+
         Args:
             user_id: Unique identifier for the user
             query: The user's question
@@ -427,32 +486,32 @@ class ConversationHistory:
         """
         if user_id not in self.conversations:
             self.conversations[user_id] = []
-            
+
         entry = ConversationEntry(
             timestamp=datetime.now(),
             user_query=query,
             answer=answer,
         )
-        
+
         self.conversations[user_id].append(entry)
         self._save_conversation(user_id)
-        
+
     def get_history(self, user_id: str, limit: int = 5) -> List[ConversationEntry]:
         """
         Get recent conversation history for a user.
-        
+
         Args:
             user_id: Unique identifier for the user
             limit: Maximum number of entries to return
-            
+
         Returns:
             List of conversation entries, most recent first
         """
         if user_id not in self.conversations:
             self._load_conversation(user_id)
-            
+
         history = self.conversations.get(user_id, [])
-        
+
         # Convert to dict format and limit number of entries
         return [
             ConversationEntry(
@@ -462,204 +521,294 @@ class ConversationHistory:
             )
             for entry in history[-limit:][::-1]  # Most recent first
         ]
-        
+
     def get_context_from_history(self, user_id: str, limit: int = 3) -> str:
         """
         Generate a conversation context string from recent history.
-        
+
         Args:
             user_id: Unique identifier for the user
             limit: Maximum number of past exchanges to include
-            
+
         Returns:
             Formatted conversation context string
         """
         if user_id not in self.conversations:
             self._load_conversation(user_id)
-            
+
         history = self.conversations.get(user_id, [])
-        
+
         if not history:
             return ""
-            
+
         # Get most recent exchanges
         recent = history[-limit:]
-        
+
         # Format as conversation context
         context = "Previous conversation:\n"
         for entry in recent:
             context += f"User: {entry.user_query}\n"
             context += f"Assistant: {entry.answer}\n\n"
-            
+
         return context
-    
+
     def _save_conversation(self, user_id: str) -> None:
         """
         Save a user's conversation history to disk.
-        
+
         Args:
             user_id: Unique identifier for the user
         """
         file_path = os.path.join(self.save_directory, f"{user_id}.json")
-        
+
         # Use model_dump() for serialization
-        entries = [entry.model_dump(mode='json') for entry in self.conversations[user_id]]
-        
-        with open(file_path, 'w') as f:
+        entries = [
+            entry.model_dump(mode="json") for entry in self.conversations[user_id]
+        ]
+
+        with open(file_path, "w") as f:
             json.dump(entries, f, indent=2)
-    
+
     def _load_conversation(self, user_id: str) -> None:
         """
         Load a user's conversation history from disk.
-        
+
         Args:
             user_id: Unique identifier for the user
         """
         file_path = os.path.join(self.save_directory, f"{user_id}.json")
-        
+
         if not os.path.exists(file_path):
             self.conversations[user_id] = []
             return
-            
+
         try:
-            with open(file_path, 'r') as f:
+            with open(file_path, "r") as f:
                 entries_data = json.load(f)
-                
+
             # Use model_validate for deserialization
             self.conversations[user_id] = [
                 ConversationEntry.model_validate(entry_data)
                 for entry_data in entries_data
             ]
         except Exception as e:
-            print(f"Error loading conversation for {user_id}: {e}")
+            logger.error(f"Error loading conversation for {user_id}: {e}")
             self.conversations[user_id] = []
+
 
 class QueryRouter:
     """Routes queries to appropriate vector stores based on content."""
-    
-    def __init__(self, stores: Dict[str, FAISS], llm_model: str = "gpt-4o-mini"):
+
+    def __init__(
+        self,
+        stores: Dict[str, FAISS],
+        llm_model: str = "gpt-4o-mini",
+        async_client: openai.AsyncOpenAI = openai.AsyncOpenAI(),
+    ):
         """
         Initialize the query router.
-        
+
         Args:
             stores: Dictionary mapping store names to FAISS vector stores
             llm_model: Model name for the routing LLM
+            async_client: Shared asynchronous OpenAI client
         """
         self.stores = stores
         self.llm_model = llm_model
-        self.client = openai.OpenAI()
-        self.async_client = openai.AsyncOpenAI()
-        
+        self.async_client = async_client
+
         # Build tools dynamically based on available stores
         self.tools = []
         for store_name in stores.keys():
-            self.tools.append({
-                "type": "function",
-                "function": {
-                    "name": f"query_{store_name.lower()}",
-                    "description": f"Get information about {store_name}",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": f"The query from the user (verbatim) that should pertain to {store_name}",
-                            }
+            self.tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": f"query_{store_name.lower()}",
+                        "description": f"Get information about {store_name}",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": f"The query from the user (verbatim) that should pertain to {store_name}",
+                                }
+                            },
+                            "required": ["query"],
                         },
-                        "required": ["query"],
                     },
-                },
-            })
-    
+                }
+            )
 
     @log_timing
     async def route_query_async(self, user_query: str) -> List[QueryResult]:
         """
-        Async version of route_query to route a user query to the appropriate vector store(s).
-        
+        Routes a user query to appropriate vector stores based on content.
+
         Args:
             user_query: The user's question
-            
+
         Returns:
             List of query results including document content and relevance scores
         """
         logger.info(f"Routing query: '{user_query}'")
-
-        messages = [{"role": "user", "content": user_query}]
         results = []
-        
-        try:
-            response = await self.async_client.chat.completions.create(
-                model=self.llm_model,
-                messages=messages,
-                tools=self.tools,
-                tool_choice="auto",
-            )
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
 
-            if tool_calls:
-                route_destinations = [tool_call.function.name.split('_', 1)[1].capitalize() 
-                                     for tool_call in tool_calls]
-                logger.info(f"Query routed to: {', '.join(route_destinations)}")
-                for tool_call in tool_calls:
-                    function_name = tool_call.function.name
-                    function_args = json.loads(tool_call.function.arguments)
-                    query = function_args.get("query")
-                    
-                    # Extract store name from function name (query_storename)
-                    store_name = function_name.split("_", 1)[1].capitalize()
-                    
-                    if store_name.lower() in [name.lower() for name in self.stores.keys()]:
-                        print(f"Routing to {store_name} vector store for query: {query}")
-                        store = self.stores[store_name] if store_name in self.stores else self.stores[store_name.lower()]
-                        
-                        # Use similarity_search_with_score instead of similarity_search
-                        search_results = store.similarity_search_with_score(query, k=3)
-                        query_docs = []
-                        
-                        for i, (doc, score) in enumerate(search_results):
-                            # Extract ID from document metadata if available or generate one
-                            doc_id = None
-                            if hasattr(doc, 'metadata') and doc.metadata:
-                                doc_id = doc.metadata.get('id') or doc.metadata.get('_id')
-                            
-                            # If no ID found in metadata, generate one
-                            if not doc_id:
-                                doc_id = f"{store_name.lower()}_{i}_{uuid4()}"
-                                
-                            query_docs.append(
-                                QueryDocument(
-                                    content=doc.page_content, 
-                                    relevance_score=score,
-                                    doc_id=doc_id,
-                                    metadata=doc.metadata
-                                )
-                            )
-                        results.append(QueryResult(source=store_name, query=query, docs=query_docs))
-            else:
+        try:
+            # Get tool calls from LLM
+            tool_calls = await self._get_tool_calls(user_query)
+
+            if not tool_calls:
                 logger.warning("No relevant sources identified for query")
+                return results
+
+            # Log routing destinations
+            route_destinations = [
+                self._extract_store_name(tool_call.function.name)
+                for tool_call in tool_calls
+            ]
+            logger.info(f"Query routed to: {', '.join(route_destinations)}")
+
+            # Process each tool call
+            for tool_call in tool_calls:
+                result = await self._process_tool_call(tool_call)
+                if result:
+                    results.append(result)
+
         except Exception as e:
-            print(f"An error occurred in routing: {e}")
-                
-        logger.info(f"Routing completed, retrieved {sum(len(r.docs) for r in results)} documents")
-        
+            logger.error(f"An error occurred in routing: {e}")
+
+        logger.info(
+            f"Routing completed, retrieved {sum(len(r.docs) for r in results)} documents"
+        )
         return results
 
-class AnswerGenerator:
+    async def _get_tool_calls(self, user_query: str):
+        """Get tool calls from LLM for the query."""
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "user", "content": user_query}
+        ]
+        response = await self.async_client.chat.completions.create(
+            model=self.llm_model,
+            messages=messages,
+            tools=self.tools,
+            tool_choice="auto",
+        )
+        return response.choices[0].message.tool_calls
+
+    def _extract_store_name(self, function_name: str) -> str:
+        """Extract and normalize store name from function name."""
+        return function_name.split("_", 1)[1].capitalize()
+
+    def _get_store(self, store_name: str):
+        """Get the correct store based on name, handling case differences."""
+        normalized_name = store_name.lower()
+        for name, store in self.stores.items():
+            if name.lower() == normalized_name:
+                return store
+        return None
+
+    async def _process_tool_call(self, tool_call) -> Optional[QueryResult]:
+        """Process a single tool call and return query result."""
+        try:
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+            query = function_args.get("query")
+
+            store_name = self._extract_store_name(function_name)
+            store = self._get_store(store_name)
+
+            if not store:
+                logger.warning(f"Store not found for: {store_name}")
+                return None
+
+            logger.info(f"Routing to {store_name} vector store for query: {query}")
+
+            # Get search results
+            search_results = store.similarity_search_with_score(query, k=3)
+            query_docs = self._create_query_documents(search_results, store_name)
+
+            return QueryResult(source=store_name, query=query, docs=query_docs)
+
+        except Exception as e:
+            logger.error(f"Error processing tool call: {e}")
+            return None
+
+    def _create_query_documents(
+        self, search_results, store_name: str
+    ) -> List[QueryDocument]:
+        """Create QueryDocument objects from search results."""
+        query_docs = []
+
+        for i, (doc, score) in enumerate(search_results):
+            # Extract or generate doc_id
+            doc_id = self._extract_doc_id(doc, store_name, i)
+
+            query_docs.append(
+                QueryDocument(
+                    content=doc.page_content,
+                    relevance_score=score,
+                    doc_id=doc_id,
+                    metadata=doc.metadata,
+                    source_name=store_name,
+                )
+            )
+        return query_docs
+
+    def _extract_doc_id(self, doc, store_name: str, index: int) -> str:
+        """Extract document ID from metadata or generate a new one."""
+        if hasattr(doc, "metadata") and doc.metadata:
+            doc_id = doc.metadata.get("id") or doc.metadata.get("_id")
+            if doc_id:
+                return str(doc_id)
+
+        return f"{store_name.lower()}_{index}_{uuid4()}"
+
+
+class AnswerGenerator(BaseProcessor):
     """Generates answers from retrieved documents."""
-    
-    def __init__(self, llm_model: str = "gpt-4o-mini"):
-        """
-        Initialize the answer generator.
-        
-        Args:
-            llm_model: Model name for the answer generation LLM
-        """
-        self.llm_model   = llm_model
-        self.async_client = openai.AsyncOpenAI()   # new async
-    
-    # Update the generate_answer_async method to return cited answers
+
+    def _format_documents_for_prompt(self, retrieval_results: List[QueryResult]) -> str:
+        """Format documents from retrieval results into a string for the LLM prompt."""
+        doc_context = ""
+        for result in retrieval_results:
+            for doc in result.docs:
+                doc_id = doc.doc_id or f"doc_{uuid4()}"
+                doc_context += f"[{doc_id}] Source: {doc.source_name}\n"
+                doc_context += f"Content: {doc.content}\n\n"
+        return doc_context
+
+    def _validate_citations(
+        self, cited_answer: CitedAnswerResult, retrieval_results: List[QueryResult]
+    ):
+        """Validate citations in the answer against retrieved documents using fuzzy matching."""
+        # Create a document lookup map for efficient access
+        doc_map = {}
+        for result in retrieval_results:
+            for doc in result.docs:
+                doc_map[doc.doc_id] = doc
+
+        match_threshold = 85  # Adjust as needed - higher is stricter
+
+        for statement in cited_answer.statements:
+            for citation in statement.citations:
+                # Direct lookup instead of nested loops
+                if citation.doc_id in doc_map:
+                    doc = doc_map[citation.doc_id]
+                    # Use partial_ratio for best substring matching
+                    similarity = fuzz.partial_ratio(citation.quote, doc.content)
+                    if similarity >= match_threshold:
+                        logger.debug(f"Citation validated with {similarity}% match")
+                    else:
+                        logger.warning(
+                            f"Citation failed validation: {similarity}% match below threshold of {match_threshold}%"
+                        )
+                        logger.debug(f"Quote: '{citation.quote[:50]}...'")
+                else:
+                    logger.warning(
+                        f"Invalid citation: doc_id={citation.doc_id}, source={citation.source_name} - document not found"
+                    )
+
     @log_timing
     async def generate_answer_async(
         self,
@@ -667,370 +816,161 @@ class AnswerGenerator:
         retrieval_results: List[QueryResult],
         conversation_context: str = "",
     ) -> CitedAnswerResult:
-        """
-        Generates an answer with citations from retrieved documents.
-        
-        Args:
-            user_question: The user's question
-            retrieval_results: Retrieved documents from vector stores
-            conversation_context: Optional conversation history context
-            
-        Returns:
-            A CitedAnswerResult with the answer and structured citations
-        """
+        """Generates an answer with citations from retrieved documents."""
         if not retrieval_results:
-            return CitedAnswerResult(
-                original_query=user_question,
-                answer="I'm sorry, I couldn't find relevant information to answer your question.",
-                cited_statements=[
-                    CitedStatement(
-                        text="No relevant information found.",
-                        citations=[],
-                        is_supported=False
-                    )
-                ],
-                sources=[],
-                unsupported_info="The entire answer is unsupported as no relevant documents were found."
-            )
-
-        # Format documents with source name and ID for clear citation
-        formatted_docs = []
-        source_names = set()
-        
-        for result in retrieval_results:
-            source_name = result.source
-            source_names.add(source_name)
+            return CitedAnswerResult(statements=[])
             
-            for doc in result.docs:
-                # Ensure each document has an ID
-                doc_id = doc.doc_id or f"doc_{len(formatted_docs)}"
-                
-                formatted_docs.append({
-                    "source": source_name,
-                    "id": doc_id,
-                    "content": doc.content,
-                    "relevance_score": doc.relevance_score
-                })
+        # Format documents for the prompt
+        doc_context = self._format_documents_for_prompt(retrieval_results)
         
-        doc_context = ""
-        for i, doc in enumerate(formatted_docs):
-            doc_context += f"[{doc['id']}] Source: {doc['source']}\n"
-            doc_context += f"Content: {doc['content']}\n\n"
-
-        system_content = """You are a medical assistant that generates answers with precise citations.
-
-For each statement or claim in your answer, you must cite the specific document(s) that support it.
-
-Your response must be structured with:
-1. A complete answer to the question
-2. A breakdown of statements with citations to specific document IDs
-3. A clear indication of which parts are supported by the documents and which aren't
-
-Follow these guidelines:
-- Use the document IDs in the format [ID] to cite sources
-- Don't make up information - if the documents don't contain needed information, state this clearly
-- Group similar information from multiple sources when possible
-- For each statement, determine if it's supported by the documents
-"""
-
-        if conversation_context:
-            system_content += "\n\nHere is relevant conversation context you should consider:\n" + conversation_context
-
-        rag_messages = [
-            {"role": "system", "content": system_content},
-            {
-                "role": "user",
-                "content": f"Documents:\n{doc_context}\n\nQuestion: {user_question}\n\nPlease provide a complete answer with citations to the specific document IDs that support each statement."
-            }
-        ]
-
         logger.info(f"Generating cited answer for query: '{user_question}'")
-        try:
-            response = await self.async_client.beta.chat.completions.parse(
-                model=self.llm_model,
-                messages=rag_messages,
-                response_format=CitedAnswerResult,
-                temperature=0.0  # Low temperature for factual accuracy
-            )
-            
-            result = response.choices[0].message.parsed            
-            if result is None:
-                raise Exception("No result generated")
-            logger.info(f"Generated answer with {len(result.cited_statements)} cited statements")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error generating cited answer: {e}", exc_info=True)
-            # Fallback to basic answer without structured citations
-            sources = list(source_names)
-            
-            # Try to generate a basic answer without parsing
-            try:
-                basic_response = await self.async_client.chat.completions.create(
-                    model=self.llm_model,
-                    messages=rag_messages,
-                )
-                answer_text = basic_response.choices[0].message.content
-            except:
-                answer_text = "I'm sorry, I encountered an error generating an answer to your question."
-                
-            return CitedAnswerResult(
-                answer=answer_text,
-                cited_statements=[
-                    CitedStatement(
-                        text=answer_text,
-                        citations=[],
-                        is_supported=False
-                    )
-                ],
-            )
-
-class RetrievalEvaluator:
-    """Evaluates if retrieved documents contain sufficient information to answer the query."""
-    
-    def __init__(self, llm_model: str = "gpt-4o-mini"):
-        """
-        Initialize the retrieval evaluator.
+        default_response = CitedAnswerResult(statements=[])
         
-        Args:
-            llm_model: Model name for the evaluation LLM
-        """
-        self.llm_model = llm_model
-        self.client = openai.OpenAI()
-        self.async_client = openai.AsyncOpenAI()
-    
+        # Use the base class _call_llm method instead of direct calls
+        response = await self._call_llm(
+            prompt_name="answer_generation",
+            user_question=user_question,
+            doc_context=doc_context,
+            conversation_context=conversation_context,
+            temperature=0.0,  # Low temperature for factual accuracy
+            response_format=CitedAnswerResult,
+            default_response=default_response,
+        )
+        
+        if response is None:
+            return default_response
+
+        # Validate citations against source documents
+        self._validate_citations(response, retrieval_results)
+        return response
+
+
+class RetrievalEvaluator(BaseProcessor):
+    """Evaluates if retrieved documents contain sufficient information to answer the query."""
+
+    def _prepare_context(
+        self, retrieval_results: List[QueryResult]
+    ) -> Tuple[str, List[str]]:
+        """Extract content and source names from retrieval results."""
+        combined_context = ""
+        sources = []
+
+        for result in retrieval_results:
+            combined_context += "\n\n" + "\n\n".join(
+                [doc.content for doc in result.docs]
+            )
+            sources.append(result.source)
+
+        return combined_context, sources
+
+    async def _fetch_additional_results(
+        self, additional_queries: List[str], router: QueryRouter
+    ) -> List[QueryResult]:
+        """Fetch additional results for the specified queries."""
+        if not additional_queries:
+            return []
+
+        logger.info(f"Executing {len(additional_queries)} follow-up queries")
+        for i, query in enumerate(additional_queries):
+            logger.debug(f"  Follow-up query {i+1}: '{query}'")
+
+        try:
+            routing_tasks = [
+                router.route_query_async(query) for query in additional_queries
+            ]
+            results_list = await asyncio.gather(*routing_tasks)
+
+            # Flatten the results
+            additional_results = []
+            for results in results_list:
+                additional_results.extend(results)
+
+            return additional_results
+        except Exception as e:
+            logger.error(f"Error fetching additional results: {e}")
+            return []
+
     @log_timing
     async def evaluate_retrieval(
-        self, 
-        original_query: str, 
+        self,
+        original_query: str,
         clarified_query: str,
         retrieval_results: List[QueryResult],
-        router: QueryRouter
+        router: QueryRouter,
     ) -> List[QueryResult]:
-        """
-        Evaluate if retrieval results are sufficient and generate additional queries if needed.
-        
-        Args:
-            original_query: The original user query
-            clarified_query: The clarified query after preprocessing
-            retrieval_results: List of initial query results from different sources
-            router: Query router to fetch additional results
-            
-        Returns:
-            Enhanced list of query results with additional information if needed
-        """
+        """Evaluate if retrieval results are sufficient and get additional information if needed."""
         doc_count = sum(len(r.docs) for r in retrieval_results)
-        logger.info(f"Evaluating retrieval results: {doc_count} documents from {len(retrieval_results)} sources")
+        logger.info(
+            f"Evaluating retrieval results: {doc_count} documents from {len(retrieval_results)} sources"
+        )
 
         # Skip evaluation if no results
         if not retrieval_results:
             return retrieval_results
-            
-        # Combine context from all sources
-        combined_context = ""
-        sources = []
-        
-        for result in retrieval_results:
-            combined_context += "\n\n" + "\n\n".join([doc.content for doc in result.docs])
-            sources.append(result.source)
-        
-        # Create evaluation prompt
-        eval_prompt = [
-            {
-                "role": "system", 
-                "content": """You are an AI assistant that evaluates if retrieved medical information is sufficient to answer a user's query.
-                Analyze the retrieved information and the query to determine:
-                1. If the information fully addresses the query
-                2. If there are information gaps that need to be filled
-                3. What additional queries would retrieve the missing information
-                
-                For example, if a user asks "How does Lipitor compare to Crestor for elderly patients?" and the retrieved information 
-                only discusses Lipitor's effects on elderly patients, you should indicate:
-                - The information is not sufficient
-                - Information about Crestor's effects on elderly patients is missing
-                - Suggest an additional query like "How does Crestor affect elderly patients?"
-                
-                Be thorough in your analysis and ensure all aspects of the query can be answered.
-                """
-            },
-            {
-                "role": "user", 
-                "content": f"""
-                Original Query: {original_query}
-                Clarified Query: {clarified_query}
-                
-                Retrieved Information:
-                {combined_context}
-                
-                Sources: {', '.join(sources)}
-                
-                Evaluate if this information is sufficient to fully answer the query.
-                If not, specify what information is missing and suggest additional queries to retrieve it.
-                """
-            }
-        ]
-        
-        try:
-            response = await self.async_client.beta.chat.completions.parse(
-                model=self.llm_model,
-                messages=eval_prompt,
-                temperature=0.1,
-                response_format=RetrievalEvaluation
+
+        # Prepare context from retrieval results
+        context, sources = self._prepare_context(retrieval_results)
+
+        # Use the base class _call_llm method instead of custom _evaluate_with_llm
+        evaluation = await self._call_llm(
+            prompt_name="retrieval_evaluation",
+            original_query=original_query,
+            clarified_query=clarified_query,
+            retrieved_information=context,
+            sources=", ".join(sources),
+            temperature=0.1,
+            response_format=RetrievalEvaluation,
+            default_response=RetrievalEvaluation(
+                is_sufficient=True, missing_information="", additional_queries=[]
             )
-            
-            evaluation = response.choices[0].message.parsed
-            if evaluation is None:
-                raise Exception("No evaluation generated")
-            # Check if additional queries are needed
-            if not evaluation.is_sufficient and evaluation.additional_queries:
-                logger.info(f"Retrieval insufficient. Missing info: {evaluation.missing_information}")
-                logger.info(f"Running {len(evaluation.additional_queries)} follow-up queries:")
-                for i, q in enumerate(evaluation.additional_queries):
-                    logger.debug(f"  Follow-up query {i+1}: '{q}'")
-                
-                # Get additional retrieval results asynchronously
-                if evaluation.additional_queries:
-                    print("Executing follow-up queries asynchronously...")
-                    routing_tasks = [router.route_query_async(query) for query in evaluation.additional_queries]
-                    results_list = await asyncio.gather(*routing_tasks)
-                    
-                    # Flatten the results and extend retrieval_results
-                    additional_results = []
-                    for results in results_list:
-                        additional_results.extend(results)
-                    
-                    retrieval_results.extend(additional_results)
-                    logger.info(f"Added {len(additional_results)} additional retrieval results")
-            else:
-                logger.info("Retrieved information is sufficient")
-                
-            final_doc_count = sum(len(r.docs) for r in retrieval_results)
-            logger.info(f"Evaluation completed, final document count: {final_doc_count}")
-            
-            return retrieval_results
-            
-        except Exception as e:
-            print(f"Error during retrieval evaluation: {e}")
-            # If evaluation fails, return original results
-            return retrieval_results
+        )
 
-    @log_timing
-    async def filter_irrelevant_documents(
-        self,
-        query: str,
-        retrieval_results: List[QueryResult],
-        relevance_threshold: float = 0.8
-    ) -> List[QueryResult]:
-        """
-        Filter out documents that are irrelevant to the query by evaluating each document asynchronously.
-        
-        Args:
-            query: The user query
-            retrieval_results: List of query results from different sources
-            relevance_threshold: Score threshold above which documents are automatically kept
-            
-        Returns:
-            Filtered list of query results with irrelevant documents removed
-        """
-        orig_doc_count = sum(len(r.docs) for r in retrieval_results)
-        logger.info(f"Filtering {orig_doc_count} documents for relevance to '{query}'")
+        # Process evaluation result
+        enhanced_results = list(retrieval_results)  # Create a copy to avoid modifying the original
 
-        filtered_results = []
-        
-        async def evaluate_document(doc: QueryDocument) -> Tuple[QueryDocument, bool]:
-            """Evaluate a single document for relevance to the query."""
-            eval_prompt = [
-                {
-                    "role": "system", 
-                    "content": """You are an AI assistant that evaluates if a document is relevant to a query.
-                    A document is relevant if it contains information that could help answer the query.
-                    A document is irrelevant if it has no information related to the query or addresses a completely different topic.
-                    Provide a brief explanation and determine if the document is relevant."""
-                },
-                {
-                    "role": "user", 
-                    "content": f"Query: {query}\n\nDocument:\n{doc.content}\n\nEvaluate whether this document is relevant to the query."
-                }
-            ]
-            
-            try:
-                response = await self.async_client.beta.chat.completions.parse(
-                    model=self.llm_model,
-                    messages=eval_prompt,
-                    temperature=0.1,
-                    response_format=DocumentRelevanceEvaluation
+        if (
+            evaluation
+            and not evaluation.is_sufficient
+            and evaluation.additional_queries
+        ):
+            logger.info(
+                f"Retrieval insufficient. Missing info: {evaluation.missing_information}"
+            )
+
+            # Fetch additional results
+            additional_results = await self._fetch_additional_results(
+                evaluation.additional_queries, router
+            )
+
+            if additional_results:
+                enhanced_results.extend(additional_results)
+                logger.info(
+                    f"Added {len(additional_results)} additional retrieval results"
                 )
-                
-                evaluation = response.choices[0].message.parsed
-                return (doc, evaluation.is_relevant)
-            except Exception as e:
-                print(f"Error evaluating document: {e}")
-                return (doc, True)  # Keep document if evaluation fails
-        
-        for result in retrieval_results:
-            # Automatically keep documents with high relevance scores
-            high_score_docs = [doc for doc in result.docs if doc.relevance_score > relevance_threshold]
-            low_score_docs = [doc for doc in result.docs if doc.relevance_score <= relevance_threshold]
-            
-            # Create evaluation tasks for low-score documents
-            if low_score_docs:
-                evaluation_tasks = [evaluate_document(doc) for doc in low_score_docs]
-                evaluation_results = await asyncio.gather(*evaluation_tasks)
-                
-                # Filter based on evaluation results
-                relevant_low_score_docs = [doc for doc, is_relevant in evaluation_results if is_relevant]
-                all_relevant_docs = high_score_docs + relevant_low_score_docs
-            else:
-                all_relevant_docs = high_score_docs
-            
-            # Only add the result if it has relevant documents
-            if all_relevant_docs:
-                filtered_results.append(QueryResult(
-                    source=result.source,
-                    query=result.query,
-                    docs=all_relevant_docs
-                ))
-            
-        kept_doc_count = sum(len(r.docs) for r in filtered_results)
-        dropped = orig_doc_count - kept_doc_count
-
-        if dropped > 0:
-            logger.info(f"Filtering completed: removed {dropped} irrelevant documents")
         else:
-            logger.info(f"Filtering completed: all documents kept")
-        
-        return filtered_results
+            logger.info("Retrieved information is sufficient or evaluation failed")
 
+        final_doc_count = sum(len(r.docs) for r in enhanced_results)
+        logger.info(f"Evaluation completed, final document count: {final_doc_count}")
+
+        return enhanced_results
 
 
 # Add this new class for handling conversation context extraction
-class ConversationContextProcessor:
+class ConversationContextProcessor(BaseProcessor):
     """Processes the conversation history to extract only relevant context for the current query."""
-    
-    def __init__(self, llm_model: str = "gpt-4o-mini"):
-        """
-        Initialize the conversation context processor.
-        
-        Args:
-            llm_model: Model name for context processing
-        """
-        self.llm_model = llm_model
-        self.client = openai.OpenAI()
-        self.async_client = openai.AsyncOpenAI()
-    
+
     @log_timing
     async def extract_relevant_context(
-        self,
-        query: str,
-        conversation_history: List[ConversationEntry]
+        self, query: str, conversation_history: List[ConversationEntry]
     ) -> RelevantHistoryContext:
         """
         Extract only the relevant parts of conversation history for the current query.
-        
+
         Args:
             query: The current user query (clarified)
             conversation_history: Full conversation history
-            
+
         Returns:
             RelevantHistoryContext with the formatted context string and relevant entries
         """
@@ -1038,97 +978,60 @@ class ConversationContextProcessor:
             return RelevantHistoryContext(
                 required_context=False,
                 explanation="No conversation history available",
-                relevant_snippets=""
+                relevant_snippets="",
             )
-        
+
         # Format conversation history for the prompt
         history_text = "Previous conversation:\n"
         for i, entry in enumerate(conversation_history):
             history_text += f"[{i+1}] User: {entry.user_query}\n"
             history_text += f"    Assistant: {entry.answer}\n\n"
-        
-        # Create the prompt
-        context_prompt = [
-            {
-                "role": "system", 
-                "content": """You are an AI assistant that analyzes conversation history to extract only the relevant and required parts needed to answer a current query.
-                
-                Your task is to identify information from previous exchanges that provides necessary context or background 
-                for answering the current query effectively. This includes:
-                
-                - Prior information the user shared that relates to their current question
-                - Previous answers that contain information needed for the current response
-                - Any relevant medical topics, medications, or conditions discussed previously
-                - User preferences or circumstances mentioned earlier that affect the current answer
-                
-                Provide:
-                1. A boolean value indicating if any parts of the conversation history are relevant and necessary to answer the current query
-                2. An explanation of why these entries are relevant and necessary
-                3. A formatted context string ready to be used in the answer generation prompt, representing the relevant and necessary snippetsof the conversation history
-                
-                If no parts of the conversation history are relevant to the current query, return False and an empty formatted context.
-                """
-            },
-            {
-                "role": "user", 
-                "content": f"Current query: {query}\n\n{history_text}\n\nExtract the relevant context for answering this query:"
-            }
-        ]
-        
-        try:
-            response = await self.async_client.beta.chat.completions.parse(
-                model=self.llm_model,
-                messages=context_prompt,
-                temperature=0.1,
-                response_format=RelevantHistoryContext
-            )
-            
-            return response.choices[0].message.parsed
-        
-        except Exception as e:
-            print(f"Error during context extraction: {e}")
-            # Return empty context if extraction fails
-            return RelevantHistoryContext(
-                required_context=False,
-                explanation=f"Error during context extraction: {str(e)}",
-                relevant_snippets=""
-            )
 
-class FollowUpQuestionsGenerator:
-    """Generates follow-up questions based on the answer and conversation history."""
-    
-    def __init__(self, llm_model: str = "gpt-4o-mini"):
-        """
-        Initialize the follow-up questions generator.
+        # Use the base class _call_llm method instead of direct parser calls
+        default_response = RelevantHistoryContext(
+            required_context=False,
+            explanation="No relevant context found",
+            relevant_snippets="",
+        )
         
-        Args:
-            llm_model: Model name for the LLM
-        """
-        self.llm_model = llm_model
-        self.client = openai.OpenAI()
-        self.async_client = openai.AsyncOpenAI()
-    
+        response = await self._call_llm(
+            prompt_name="context_extraction",
+            current_query=query, 
+            history_text=history_text,
+            temperature=0.1,
+            response_format=RelevantHistoryContext,
+            default_response=default_response,
+        )
+        
+        if response is None:
+            return default_response
+            
+        return response
+
+
+class FollowUpQuestionsGenerator(BaseProcessor):
+    """Generates follow-up questions based on the answer and conversation history."""
+
     @log_timing
     async def generate_follow_up_questions(
-        self, 
-        query: str, 
-        answer: str, 
-        conversation_history: Optional[List[ConversationEntry]] = None
+        self,
+        query: str,
+        answer: str,
+        conversation_history: Optional[List[ConversationEntry]] = None,
     ) -> FollowUpQuestions:
         """
-        Generate three potential follow-up questions that a user might ask based on the answer 
-        and conversation history.
-        
+        Generate three potential follow-up questions based on the answer and conversation history.
+
         Args:
             query: The original user query
             answer: The answer provided to the user
             conversation_history: Optional list of previous conversation entries
-            
+
         Returns:
             A FollowUpQuestions object containing a list of 3 follow-up questions
         """
         logger.info(f"Generating follow-up questions for query: '{query}'")
-        
+
         # Format conversation history if provided
         history_context = ""
         if conversation_history and len(conversation_history) > 0:
@@ -1136,189 +1039,205 @@ class FollowUpQuestionsGenerator:
             for i, entry in enumerate(conversation_history):
                 history_context += f"User: {entry.user_query}\n"
                 history_context += f"Assistant: {entry.answer}\n\n"
-            logger.debug(f"Using {len(conversation_history)} conversation entries for context")
-        
-        system_content = """You are an AI assistant that generates natural follow-up questions a user might ask after receiving an answer.
-        Generate exactly 3 distinct follow-up questions that:
-        1. Ask for more detail about information mentioned in the answer
-        2. Explore related topics that might be of interest
-        3. Clarify or compare aspects mentioned in the answer
-        
-        Consider the conversation history if provided to avoid suggesting questions that have already been asked.
-        The questions should be clear, concise, and directly related to the medical topic discussed.
-        """
-        
-        user_content = f"Original question: {query}\n\nAnswer: {answer}"
-        if history_context:
-            user_content = f"{history_context}\n{user_content}"
-        user_content += "\n\nSuggest three natural follow-up questions:"
-        
-        prompt = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_content}
-        ]
-        
-        try:
-            response = await self.async_client.beta.chat.completions.parse(
-                model=self.llm_model,
-                messages=prompt,
-                temperature=0.3,  # Higher temperature for more variety
-                response_format=FollowUpQuestions
+            logger.debug(
+                f"Using {len(conversation_history)} conversation entries for context"
             )
-            
-            result = response.choices[0].message.parsed
-            logger.info(f"Generated {len(result.questions)} follow-up questions")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error generating follow-up questions: {e}", exc_info=True)
-            # Return default questions if generation fails
-            return FollowUpQuestions(questions=[
-                "What are the most common side effects?",
-                "Are there any alternatives to this medication?",
-                "How long should I take this medication?"
-            ])
+
+        # Use the base class _call_llm method instead of direct calls to parser_service
+        default_response = FollowUpQuestions(questions=[])
+        
+        response = await self._call_llm(
+            prompt_name="follow_up_questions",
+            original_query=query,
+            answer=answer,
+            history_context=history_context,
+            temperature=0.3,  # Higher temperature for more variety
+            response_format=FollowUpQuestions,
+            default_response=default_response,
+        )
+
+        if response is None:
+            return default_response
+
+        return response
+
 
 class MedicalRAG:
     """
     A medical RAG system that integrates vector stores, query routing, answer generation,
     and conversation history.
     """
-    
+
     def __init__(
         self,
         vector_stores: Dict[str, FAISS],
-        router_model: str = "gpt-4o-mini",
-        generator_model: str = "gpt-4o-mini",
-        preprocessor_model: str = "gpt-4o-mini",
-        evaluator_model: str = "gpt-4o-mini",
-        context_processor_model: str = "gpt-4o-mini",
-        follow_up_generator_model: str = "gpt-4o-mini",
-        conversation_history_dir: str = "data/conversations"
+        llm_model: str = "gpt-4o-mini",
+        parser_service: Optional[LLMParserService] = None,
+        conversation_history_dir: str = "data/conversations",
+        prompts_dir: str = "prompts",
     ):
         """
-        Initialize the Medical RAG system.
+        Initialize the Medical RAG system with a simplified configuration.
         
         Args:
             vector_stores: Dictionary mapping store names to FAISS vector stores
-            router_model: Model for query routing
-            generator_model: Model for answer generation
-            preprocessor_model: Model for query preprocessing/clarification
-            evaluator_model: Model for retrieval evaluation
-            context_processor_model: Model for conversation context processing
-            follow_up_generator_model: Model for generating follow-up questions
+            llm_model: Single model name used for all LLM components
+            parser_service: Service for making parsed LLM calls
             conversation_history_dir: Directory to store conversation histories
+            prompts_dir: Directory containing Jinja templates for prompts
         """
-        self.router = QueryRouter(vector_stores, router_model)
-        self.generator = AnswerGenerator(generator_model)
-        self.preprocessor = QueryPreprocessor(preprocessor_model)
-        self.evaluator = RetrievalEvaluator(evaluator_model)
-        self.context_processor = ConversationContextProcessor(context_processor_model)
-        self.follow_up_generator = FollowUpQuestionsGenerator(follow_up_generator_model)
+        # Set up shared resources
+        self.async_client = openai.AsyncOpenAI()
+        self.prompt_manager = PromptManager(prompts_dir)
+        self.parser_service = parser_service or LLMParserService(self.async_client)
+        
+        # Initialize the router (special case as it doesn't use BaseProcessor)
+        self.router = QueryRouter(
+            vector_stores, 
+            llm_model, 
+            self.async_client
+        )
+        
+        # All BaseProcessor components share the same model and resources
+        common_args = {
+            "llm_model": llm_model,
+            "async_client": self.async_client,
+            "prompt_manager": self.prompt_manager,
+            "parser_service": self.parser_service
+        }
+        
+        self.generator = AnswerGenerator(**common_args)
+        self.preprocessor = QueryPreprocessor(**common_args)
+        self.evaluator = RetrievalEvaluator(**common_args)
+        self.context_processor = ConversationContextProcessor(**common_args)
+        self.follow_up_generator = FollowUpQuestionsGenerator(**common_args)
+        
+        # Initialize conversation history
         self.conversation_history = ConversationHistory(conversation_history_dir)
-    
-    
-    
-    def get_conversation_history(self, user_id: str, limit: int = 5) -> List[ConversationEntry]:
+
+    def get_conversation_history(
+        self, user_id: str, limit: int = 5
+    ) -> List[ConversationEntry]:
         """
         Get recent conversation history for a user.
-        
+
         Args:
             user_id: Unique identifier for the user
             limit: Maximum number of entries to return
-            
+
         Returns:
             List of conversation entries, most recent first
         """
         return self.conversation_history.get_history(user_id, limit)
 
     @log_timing
-    async def process_query_optimistic_async(self, user_id: str, user_query: str, use_history: bool = True):
+    async def process_query_optimistic_async(
+        self, user_id: str, user_query: str, use_history: bool = True
+    ):
         """Processes a user query using an optimistic approach with early answers and refinement."""
-        logger.info(f"Processing query optimistically for user '{user_id}': '{user_query}'")
+        logger.info(
+            f"Processing query optimistically for user '{user_id}': '{user_query}'"
+        )
         logger.info(f"History enabled: {use_history}")
-        
+
         # Store the current user_id for use in other methods
         self._current_user_id = user_id
-        
+
         overall_start = time.time()
         history = self.conversation_history.get_history(user_id) if use_history else []
         if history:
             logger.info(f"Found {len(history)} historical entries for user")
-        
+
         async with asyncio.TaskGroup() as tg:
             # Phase 1: Launch initial parallel tasks
-            tasks = await self._launch_initial_tasks(tg, user_query, history, use_history)
-            
+            tasks = await self._launch_initial_tasks(
+                tg, user_query, history, use_history
+            )
+
             # Phase 2: Fast path - generate initial answer
             fast_answer, initial_results = await self._generate_fast_answer_path(
-                tg, tasks['retrieval'], user_query
+                tg, tasks["retrieval"], user_query
             )
             yield fast_answer
-            
+
             # Phase 3: Process clarification and decomposition results
-            final_query, queries, need_new_retrieval = await self._determine_final_query(
-                tasks['clarify'], tasks['decompose'], user_query
+            final_query, queries, need_new_retrieval = (
+                await self._determine_final_query(
+                    tasks["clarify"], tasks["decompose"], user_query
+                )
             )
-            
+
             # Phase 4: Get final retrieval results
             final_results, need_new_eval = await self._perform_final_retrieval(
                 tg, need_new_retrieval, queries, initial_results, user_query
             )
-            
+
             # Phase 5: Evaluate retrieval and extract context
             filtered_results, ctx_result = await self._evaluate_and_contextualize(
-                tg, tasks, need_new_eval, tasks.get('optimistic_eval'), user_query, 
-                final_query, final_results
+                tg,
+                tasks,
+                need_new_eval,
+                tasks.get("optimistic_eval"),
+                user_query,
+                final_query,
+                final_results,
             )
-            
+
             # Phase 6: Generate refined answer
             refined_answer = await self._generate_refined_answer(
                 final_query, filtered_results, ctx_result
             )
-            
+
             # Phase 7: Update history and return final answer
             if refined_answer.answer != fast_answer.answer:
                 logger.info("YIELDING REFINED ANSWER")
                 yield refined_answer
             else:
                 logger.info("Fast answer was optimal, not yielding refined answer")
-            
+
             # Save to history
             self.conversation_history.add_entry(
-                user_id, user_query, refined_answer.answer,
+                user_id,
+                user_query,
+                refined_answer.answer,
             )
             logger.info("Conversation history updated")
-            
+
             # Clear the current user_id
             self._current_user_id = None
-            
+
             # Log total processing time
             total_time = time.time() - overall_start
             logger.info(f"Query processing completed in {total_time:.2f}s")
 
     async def _launch_initial_tasks(self, tg, user_query, history, use_history):
         """Launches all initial parallel tasks and returns their task objects."""
-        logger.info("PHASE 1: Starting parallel tasks (context, retrieval, clarify, decompose)")
+        logger.info(
+            "PHASE 1: Starting parallel tasks (context, retrieval, clarify, decompose)"
+        )
         tasks = {}
-        
+
         # Start context task if using history
         if use_history and history:
-            tasks['context'] = tg.create_task(
+            tasks["context"] = tg.create_task(
                 self.context_processor.extract_relevant_context(user_query, history)
             )
             logger.debug("Started context extraction task")
-        
+
         # Start retrieval, clarify, decompose tasks
         logger.debug("Starting initial retrieval task")
-        tasks['retrieval'] = tg.create_task(self.router.route_query_async(user_query))
-        
+        tasks["retrieval"] = tg.create_task(self.router.route_query_async(user_query))
+
         logger.debug("Starting clarification task")
-        tasks['clarify'] = tg.create_task(self.preprocessor.clarify_query_async(user_query))
-        
+        tasks["clarify"] = tg.create_task(
+            self.preprocessor.clarify_query_async(user_query)
+        )
+
         logger.debug("Starting decomposition task")
-        tasks['decompose'] = tg.create_task(self.preprocessor.decompose_query_async(user_query))
-        
+        tasks["decompose"] = tg.create_task(
+            self.preprocessor.decompose_query_async(user_query)
+        )
+
         return tasks
 
     async def _generate_fast_answer_path(self, tg, retrieval_task, user_query):
@@ -1326,7 +1245,7 @@ class MedicalRAG:
         logger.info("PHASE 2: Fast path - waiting for initial retrieval")
         initial_results = await retrieval_task
         logger.info(f"Initial retrieval completed")
-        
+
         # Start optimistic evaluation
         logger.debug("Starting optimistic evaluation task")
         optimistic_eval_task = tg.create_task(
@@ -1334,7 +1253,7 @@ class MedicalRAG:
                 user_query, user_query, initial_results, self.router
             )
         )
-        
+
         # Generate fast answer
         logger.info("Generating fast answer")
         fast_answer_start = time.time()
@@ -1343,7 +1262,7 @@ class MedicalRAG:
         )
         fast_answer_time = time.time() - fast_answer_start
         logger.info(f"Fast answer generated in {fast_answer_time:.2f}s")
-        
+
         return fast_answer, initial_results
 
     async def _determine_final_query(self, clarify_task, decompose_task, user_query):
@@ -1351,7 +1270,7 @@ class MedicalRAG:
         logger.info("PHASE 3: Waiting for clarification & decomposition")
         clarified = await clarify_task
         logger.info(f"Clarification completed")
-        
+
         final_query = clarified.clarified_query
         if final_query != user_query:
             logger.info(f"Query was clarified: '{user_query}' → '{final_query}'")
@@ -1362,28 +1281,32 @@ class MedicalRAG:
             logger.info("Query was not clarified, using original decomposition")
             decomposed = await decompose_task
             logger.info(f"Decomposition completed")
-        
+
         # Handle queries for retrieval
         queries = (
             decomposed.decomposed_query
             if decomposed.query_complexity == "complex"
             else [final_query]
         )
+        if queries is None:
+            queries = [final_query]
         queries = list(dict.fromkeys(queries))  # dedupe
-        
+
         # Determine if we need new retrieval
         need_new_retrieval = queries != [user_query]
         logger.info(f"Need new retrieval: {need_new_retrieval}")
-        
+
         return final_query, queries, need_new_retrieval
 
-    async def _perform_final_retrieval(self, tg, need_new_retrieval, queries, initial_results, user_query):
+    async def _perform_final_retrieval(
+        self, tg, need_new_retrieval, queries, initial_results, user_query
+    ):
         """Performs final retrieval based on clarified and decomposed queries if needed."""
         if need_new_retrieval:
             logger.info(f"PHASE 4A: Running {len(queries)} new retrieval queries")
             for i, q in enumerate(queries):
                 logger.debug(f"  Retrieval query {i+1}: '{q}'")
-            
+
             new_lists = await asyncio.gather(
                 *[self.router.route_query_async(q) for q in queries]
             )
@@ -1394,23 +1317,30 @@ class MedicalRAG:
             logger.info("PHASE 4B: No new retrieval needed, using initial results")
             final_results = initial_results
             need_new_eval = False
-        
+
         return final_results, need_new_eval
 
     async def _evaluate_and_contextualize(
-        self, tg, tasks, need_new_eval, optimistic_eval_task, user_query, final_query, final_results
+        self,
+        tg,
+        tasks,
+        need_new_eval,
+        optimistic_eval_task,
+        user_query,
+        final_query,
+        final_results,
     ):
         """Handles final evaluation and context extraction."""
         logger.info("PHASE 5: Setting up final evaluation")
         tasks_to_await = []
-        
+
         # Decide which evaluation task to use
         if need_new_eval:
             logger.info("Need new evaluation due to query/results changes")
             if optimistic_eval_task and not optimistic_eval_task.done():
                 logger.info("Cancelling optimistic evaluation task")
                 optimistic_eval_task.cancel()
-            
+
             logger.info("Creating new evaluation task")
             eval_coro = self.evaluator.evaluate_retrieval(
                 user_query, final_query, final_results, self.router
@@ -1419,15 +1349,15 @@ class MedicalRAG:
         else:
             logger.info("Reusing optimistic evaluation task")
             final_eval_task = optimistic_eval_task
-        
+
         # Build list of tasks to await
         if final_eval_task:
             tasks_to_await.append(final_eval_task)
             logger.debug("Added evaluation task to await list")
-        if 'context' in tasks:
-            tasks_to_await.append(tasks['context'])
+        if "context" in tasks:
+            tasks_to_await.append(tasks["context"])
             logger.debug("Added context task to await list")
-        
+
         # Await final tasks
         if tasks_to_await:
             logger.info(f"PHASE 6: Awaiting {len(tasks_to_await)} final tasks")
@@ -1435,64 +1365,82 @@ class MedicalRAG:
             logger.info(f"All final tasks completed")
         else:
             logger.info("PHASE 6: No final tasks to await")
-        
+
         # Extract results safely
         evaluated_results = final_results  # Default fallback
-        if final_eval_task and final_eval_task.done() and not final_eval_task.cancelled():
+        if (
+            final_eval_task
+            and final_eval_task.done()
+            and not final_eval_task.cancelled()
+        ):
             try:
                 evaluated_results = final_eval_task.result()
                 logger.info("Successfully obtained evaluation results")
             except Exception as e:
                 logger.error(f"Evaluation task failed: {e}")
                 logger.info("Falling back to unevaluated results")
-        
+
         ctx_result_obj = RelevantHistoryContext(
             required_context=False, explanation="", relevant_snippets=""
         )
-        if 'context' in tasks and tasks['context'].done() and not tasks['context'].cancelled():
+        if (
+            "context" in tasks
+            and tasks["context"].done()
+            and not tasks["context"].cancelled()
+        ):
             try:
-                ctx_result_obj = tasks['context'].result()
+                ctx_result_obj = tasks["context"].result()
                 has_context = bool(ctx_result_obj.relevant_snippets.strip())
-                logger.info(f"Context extraction succeeded. Has relevant context: {has_context}")
+                logger.info(
+                    f"Context extraction succeeded. Has relevant context: {has_context}"
+                )
             except Exception as e:
                 logger.error(f"Context task failed: {e}")
                 logger.info("Proceeding without historical context")
-        
+
         return evaluated_results, ctx_result_obj
 
-    async def _generate_refined_answer(self, final_query, filtered_results, ctx_result_obj):
+    async def _generate_refined_answer(
+        self, final_query, filtered_results, ctx_result_obj
+    ):
         """Generates the refined answer using evaluated results and context."""
         logger.info("Generating refined answer")
         refined_answer = await self.generator.generate_answer_async(
             final_query, filtered_results, ctx_result_obj.relevant_snippets
         )
         logger.info(f"Refined answer generated")
-        
+
         # Get conversation history for follow-up question generation
-        user_id = getattr(self, '_current_user_id', None)
+        user_id = getattr(self, "_current_user_id", None)
         history = []
         if user_id:
             history = self.conversation_history.get_history(user_id)
-        
+
         # Generate follow-up questions
         logger.info("Generating follow-up questions")
-        follow_up_questions = await self.follow_up_generator.generate_follow_up_questions(
-            final_query, refined_answer.answer, history
+        follow_up_questions = (
+            await self.follow_up_generator.generate_follow_up_questions(
+                final_query, refined_answer.answer, history
+            )
         )
         logger.info(f"Generated follow-up questions: {follow_up_questions.questions}")
-        
+
         # Add follow-up questions to the refined answer
-        refined_answer.follow_up_questions = follow_up_questions.questions
-        
+        # refined_answer.follow_up_questions = follow_up_questions.questions
+
         return refined_answer
-    
-    def process_query_all_answers(self, user_id: str, user_query: str, use_history: bool = True) -> List[CitedAnswerResult]:
+
+    def process_query_all_answers(
+        self, user_id: str, user_query: str, use_history: bool = True
+    ) -> List[CitedAnswerResult]:
         """Get a list of all answers (fast and refined) from the query"""
         logger.info(f"Collecting all answers for query: '{user_query}'")
-        
+
         async def _run():
             results = []
-            async for ans in self.process_query_optimistic_async(user_id, user_query, use_history):
+            async for ans in self.process_query_optimistic_async(
+                user_id, user_query, use_history
+            ):
                 is_fast = len(results) == 0
                 logger.info(f"Received {'fast' if is_fast else 'refined'} answer")
                 results.append(ans)
@@ -1501,131 +1449,65 @@ class MedicalRAG:
         start_time = time.time()
         all_results = asyncio.run(_run())
         elapsed = time.time() - start_time
-        
+
         logger.info(f"Retrieved {len(all_results)} answers in {elapsed:.2f}s")
         return all_results
+
 
 # Application setup and usage
 def setup_medical_rag() -> MedicalRAG:
     """Set up and return a configured MedicalRAG instance."""
     # Initialize vector store manager
     store_manager = VectorStoreManager()
-    
+
     # Define paths
     lipitor_save_path = "data/faiss_lipitor_index"
     metformin_save_path = "data/faiss_metformin_index"
     lipitor_data_path = "data/chunks_lipitor.json"
     metformin_data_path = "data/chunks_metformin.json"
-    
+
     # Load or create vector stores
-    lipitor_store = store_manager.load_or_create_store(lipitor_save_path, lipitor_data_path)
-    metformin_store = store_manager.load_or_create_store(metformin_save_path, metformin_data_path)
-    
+    lipitor_store = store_manager.load_or_create_store(
+        lipitor_save_path, lipitor_data_path
+    )
+    metformin_store = store_manager.load_or_create_store(
+        metformin_save_path, metformin_data_path
+    )
+
     # Create vector store dictionary
-    vector_stores = {
-        "Lipitor": lipitor_store,
-        "Metformin": metformin_store
-    }
-    
-    # Create and return MedicalRAG instance
-    return MedicalRAG(vector_stores)
+    vector_stores = {"Lipitor": lipitor_store, "Metformin": metformin_store}
+
+    # Create and return MedicalRAG instance with a single model
+    return MedicalRAG(vector_stores, llm_model="gpt-4o-mini")
 
 
-    
 # Example usage
 if __name__ == "__main__":
     # Configure more verbose logging for the example run
     logging.getLogger().setLevel(logging.INFO)
     logger.info("Starting Medical RAG example")
-    
+
     # Set up the medical RAG system
     medical_rag = setup_medical_rag()
     logger.info("Medical RAG system initialized")
-    
+
     # Simulate a conversation with a user
     user_id = "user123"
-    
+
     # First question
     logger.info("\n--- New conversation with user123 ---")
     question1 = "What are the side effects of Lipitor?"
     logger.info(f"Processing question 1: '{question1}'")
-    
+
     start_time = time.time()
     results1 = medical_rag.process_query_all_answers(user_id, question1)
     elapsed1 = time.time() - start_time
-    
-    print(f"\nUser: {question1}")
-    print(f"Fast Answer ({elapsed1:.2f}s): {results1[0].answer[:150]}...")
-    
+
+    logger.info(f"\nUser: {question1}")
+    logger.info(f"Fast Answer ({elapsed1:.2f}s): {results1[0].answer[:150]}...")
+
     if len(results1) > 1:
-        print(f"Refined Answer ({elapsed1:.2f}s): {results1[1].answer[:150]}...")
-        print(f"Answer improved: {results1[1].answer != results1[0].answer}")
+        logger.info(f"Refined Answer ({elapsed1:.2f}s): {results1[1].answer[:150]}...")
+        logger.info(f"Answer improved: {results1[1].answer != results1[0].answer}")
     else:
-        print("No refined answer needed (fast answer was sufficient)")
-    
-    # Second question (follow-up with ambiguity)
-    question2 = "Are any of these serious?"
-    logger.info(f"\nUser: {question2}")
-    results2 = medical_rag.process_query_all_answers(user_id, question2)
-    
-    print(f"Fast Answer ({elapsed1:.2f}s): {results2[0].answer[:150]}...")
-    if hasattr(results2[0], 'clarified_query') and results2[0].clarified_query:
-        print(f"[Clarified to: {results2[0].clarified_query}]")
-    
-    if len(results2) > 1:
-        print(f"Refined Answer ({elapsed1:.2f}s): {results2[1].answer[:150]}...")
-        if hasattr(results2[1], 'clarified_query') and results2[1].clarified_query:
-            print(f"[Clarified to: {results2[1].clarified_query}]")
-        print(f"Answer improved: {results2[1].answer != results2[0].answer}")
-    else:
-        print("No refined answer needed (fast answer was sufficient)")
-    
-    # Third question (topic change)
-    question3 = "How does metformin work?"
-    logger.info(f"\nUser: {question3}")
-    results3 = medical_rag.process_query_all_answers(user_id, question3)
-    
-    print(f"Fast Answer ({elapsed1:.2f}s): {results3[0].answer[:150]}...")
-    if len(results3) > 1:
-        print(f"Refined Answer ({elapsed1:.2f}s): {results3[1].answer[:150]}...")
-        print(f"Answer improved: {results3[1].answer != results3[0].answer}")
-    else:
-        print("No refined answer needed (fast answer was sufficient)")
-    
-    # Fourth question (ambiguous follow-up)
-    question4 = "What are its side effects?"
-    logger.info(f"\nUser: {question4}")
-    results4 = medical_rag.process_query_all_answers(user_id, question4)
-    
-    print(f"Fast Answer ({elapsed1:.2f}s): {results4[0].answer[:150]}...")
-    if hasattr(results4[0], 'clarified_query') and results4[0].clarified_query:
-        print(f"[Clarified to: {results4[0].clarified_query}]")
-    
-    if len(results4) > 1:
-        print(f"Refined Answer ({elapsed1:.2f}s): {results4[1].answer[:150]}...")
-        if hasattr(results4[1], 'clarified_query') and results4[1].clarified_query:
-            print(f"[Clarified to: {results4[1].clarified_query}]")
-        print(f"Answer improved: {results4[1].answer != results4[0].answer}")
-    else:
-        print("No refined answer needed (fast answer was sufficient)")
-    
-    # Fifth question (complex query)
-    question5 = "Compare the side effects of Lipitor and Crestor and tell me which one is safer for elderly patients with kidney problems?"
-    logger.info(f"\nUser: {question5}")
-    results5 = medical_rag.process_query_all_answers(user_id, question5)
-    
-    print(f"Fast Answer ({elapsed1:.2f}s): {results5[0].answer[:150]}...")
-    if len(results5) > 1:
-        print(f"Refined Answer ({elapsed1:.2f}s): {results5[1].answer[:150]}...")
-        print(f"Answer improved: {results5[1].answer != results5[0].answer}")
-    else:
-        print("No refined answer needed (fast answer was sufficient)")
-
-    # Get conversation history
-    print("\n--- Conversation History ---")
-    history = medical_rag.get_conversation_history(user_id)
-    for i, entry in enumerate(history):
-        print(f"[{i+1}] User: {entry.user_query}")
-        print(f"    Assistant: {entry.answer[:100]}...")  # Show first 100 chars
-
-
+        logger.info("No refined answer needed (fast answer was sufficient)")

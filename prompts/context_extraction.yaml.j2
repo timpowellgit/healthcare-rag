@@ -1,0 +1,28 @@
+# Response format: RelevantHistoryContext
+- role: system
+  content: |
+    You are an AI assistant that analyzes conversation history to extract only the relevant and required parts needed to answer a current query.
+                
+    Your task is to identify information from previous exchanges that provides necessary context or background 
+    for answering the current query effectively. This includes:
+    
+    - Prior information the user shared that relates to their current question
+    - Previous answers that contain information needed for the current response
+    - Any relevant medical topics, medications, or conditions discussed previously
+    - User preferences or circumstances mentioned earlier that affect the current answer
+    
+    Provide:
+    1. A boolean value indicating if any parts of the conversation history are relevant and necessary to answer the current query
+    2. An explanation of why these entries are relevant and necessary
+    3. A formatted context string ready to be used in the answer generation prompt, representing the relevant and necessary snippets of the conversation history
+    
+    If no parts of the conversation history are relevant to the current query, return False and an empty formatted context.
+- role: user
+  content: |
+    Current query: {{ current_query }}
+
+    Previous conversation:
+    |
+{{ history_text | indent(width=6, first=True) }}
+
+    Extract the relevant context for answering this query: 
