@@ -4,6 +4,7 @@ import uuid
 import pytest
 from unittest.mock import patch, AsyncMock
 from pathlib import Path
+from dataclasses import dataclass
 
 # +++++ NEW IMPORTS +++++++++++++++++++++++++++++++++++++++++++++++++++
 from rag_agent import (
@@ -377,54 +378,76 @@ class RAGOrchestrator:
             elif b.status == BranchStatus.ACTIVE and "answer" not in b.tasks and self.summary_result is None:
                  print(f"Branch {b.branch_id} waiting for summary before triggering answer.")
 
+    # +++++ Branch scoring helpers ++++++++++++++++++++++++++++++++++++++++
+    @dataclass(frozen=True)
+    class BranchTraits:
+        """Binary traits that capture how a branch refined the original query."""
+        clarified: bool
+        decomposed: bool
+        gap_filled: bool
+
+        def to_priority_tuple(self) -> tuple[int, int, int]:
+            """Convert traits to a tuple suitable for lexicographic comparison."""
+            return (
+                int(self.clarified),
+                int(self.decomposed),
+                int(self.gap_filled),
+            )
+
+    def _compute_branch_traits(self, branch: ProcessingBranch) -> "RAGOrchestrator.BranchTraits":
+        """Derive refinement traits for a given branch."""
+        clarified = (
+            branch.branch_type == "clarified"
+            or (
+                branch.parent_id is not None
+                and self.branches[branch.parent_id].branch_type == "clarified"
+            )
+        )
+        decomposed = branch.branch_type.startswith("decomposed")
+        gap_filled = (
+            branch.merged_results is not None
+            and branch.retrieved_results is not None
+            and len(branch.merged_results) > len(branch.retrieved_results)
+        )
+        return self.BranchTraits(clarified, decomposed, gap_filled)
+
+    # --------------------------------------------------------------------
     def _select_best_answer(self) -> CitedAnswerResult | None:
+        """Return the answer from the highest-priority completed branch.
+
+        Priority rules (in order):
+        1. Branches that result from query clarification.
+        2. Branches that come from query decomposition.
+        3. Branches whose evaluation step filled documentation gaps.
+        """
         print("\n--- Orchestration Complete ---")
         for b_id, b in self.branches.items():
+            traits = self._compute_branch_traits(b)
             print(
-                f"  Branch {b_id[-8:]} ({b.branch_type}): "
-                f"Status={b.status.name}, GapDocs={bool(b.merged_results and b.retrieved_results and len(b.merged_results) > len(b.retrieved_results))}"
+                f"  Branch {b_id[-8:]} ({b.branch_type}): Status={b.status.name}, "
+                f"Traits={traits}"
             )
 
-        completed = [
-            b
-            for b in self.branches.values()
-            if b.status == BranchStatus.COMPLETED and b.final_answer is not None
+        completed_branches = [
+            b for b in self.branches.values() if b.status == BranchStatus.COMPLETED and b.final_answer is not None
         ]
+        if not completed_branches:
+            print("No completed branch found with an answer.")
+            return None
 
-        if completed:
-            best_branch = max(completed, key=self._refinement_tuple)
-            print(
-                f"Returning answer from best branch "
-                f"{best_branch.branch_id[-8:]} with refinement {self._refinement_tuple(best_branch)}"
-            )
-            return best_branch.final_answer
-
-        print("No completed branch found with an answer.")
-        return None
-
-    def _refinement_tuple(self, branch) -> tuple[int, int, int]:
-        clarified = (
-            1
-            if (
-                branch.branch_type == "clarified"
-                or (
-                    branch.parent_id
-                    and self.branches[branch.parent_id].branch_type == "clarified"
-                )
-            )
-            else 0
+        # Pick the branch with the highest priority according to traits.
+        best_branch, best_traits = max(
+            ((b, self._compute_branch_traits(b)) for b in completed_branches),
+            key=lambda item: item[1].to_priority_tuple(),
         )
-        decomposed = 1 if branch.branch_type.startswith("decomposed") else 0
-        gap_filled = (
-            1
-            if (
-                branch.merged_results
-                and branch.retrieved_results
-                and len(branch.merged_results) > len(branch.retrieved_results)
-            )
-            else 0
+
+        print(
+            f"Returning answer from best branch {best_branch.branch_id[-8:]} "
+            f"({best_branch.branch_type}) with traits {best_traits}"
         )
-        return (clarified, decomposed, gap_filled)
+        return best_branch.final_answer
+
+    # --------------------------------------------------------------------
 
 
 # --- Example Usage ---
