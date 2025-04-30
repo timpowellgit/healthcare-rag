@@ -1,0 +1,86 @@
+flowchart TD
+    %% Entry point
+    Q[User Query] 
+
+    %% Parallel kickoff
+    Q --> Summary[Summary Task]
+    Q --> Clarify[Clarification Task]
+    Q --> Decompose[Decomposition Task]
+    Q --> RetrieveInit[Initial Retrieval]
+
+    %% Fast path
+    subgraph Fast_Path
+      RetrieveInit --> FastAnswer[Fast Answer Generation]
+      Summary --> FastAnswer
+      FastAnswer --> Validate[Validation Terminal]
+    end
+
+    %% Clarification branch
+    Clarify -->|if clarified Q != Q| RetrieveClar[Retrieve Q]
+    Clarify -->|if clarified Q != Q| DecomposeClar[Decompose Q]
+
+    %% Decomposition branches
+    Decompose --> RetrieveSub[Retrieve each sub-query]
+    DecomposeClar --> RetrieveSubClar[Retrieve each sub-query of Q]
+
+    %% Retrieval evaluation & gap-fill for any retrieval
+    subgraph Eval_Gap_Fill
+      RetrieveInit --> Eval[Retrieval Evaluation & Gap-Fill]
+      RetrieveClar --> Eval
+      RetrieveSub --> Eval
+      RetrieveSubClar --> Eval
+      Eval --> GapAnswer[Gap-Filled Answer Generation]
+      Summary --> GapAnswer
+      GapAnswer --> Validate
+    end %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ffcc00', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#eee'}}}%%
+flowchart TD
+  %% Inputs
+  Q(("User Query")):::queryStyle
+  Summary(("History Summary")):::summaryStyle
+  Q --> Summary
+
+  %% Fast path (boxed)
+  subgraph FastPath ["Optimistic Fast Path"]
+    class FastPath fastPathStyle
+    R0{"Initial Retrieval"}:::retrievalStyle
+    FA(("Fast Answer")):::fastAnswerStyle
+    R0 --> FA
+    Summary --> FA
+    FA --> V{{"Validate (Terminal)"}}:::validateStyle
+  end
+
+  Q --> R0
+
+  %% Speculative execution
+  Q --> C{Clarification}:::clarificationStyle
+  Q --> D(("Decomposition")):::decompositionStyle
+
+  %% Supersede fast path and decomposition
+  C -.->|supersede| R0
+  C -.->|supersede| FA
+  C -.->|supersede| D
+  D -.->|supersede| R0
+  D -.->|supersede| FA
+
+  %% Speculative retrievals
+  C --> RC{"Retrieval (Q′)"}:::retrievalStyle
+  D --> RS{"Retrieval (subs)"}:::retrievalStyle
+
+  %% Gap-fill and answer
+  RC --> G1(("Gap & Answer")):::gapAnswerStyle
+  RS --> G2(("Gap & Answer")):::gapAnswerStyle
+  Summary --> G1
+  Summary --> G2
+  G1 --> V
+  G2 --> V
+
+  %% Styles
+  classDef queryStyle fill:#a3c9a8,stroke:#000,stroke-width:2px;
+  classDef summaryStyle fill:#fff2cc,stroke:#000,stroke-width:2px;
+  classDef fastPathStyle fill:#6fa8dc,stroke:#000,stroke-width:1px;
+  classDef retrievalStyle fill:#f4cccc,stroke:#000,stroke-width:1px;
+  classDef fastAnswerStyle fill:#d9edf7,stroke:#000,stroke-width:2px;
+  classDef validateStyle fill:#d9ead3,stroke:#000,stroke-width:2px;
+  classDef clarificationStyle fill:#f6b26b,stroke:#000,stroke-width:1px;
+  classDef decompositionStyle fill:#b4a7d6,stroke:#000,stroke-width:2px;
+  classDef gapAnswerStyle fill:#ffe599,stroke:#000,stroke-width:2px;
