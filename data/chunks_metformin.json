@@ -64,6 +64,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            1
+        ],
         "doc_source": "metformin"
     },
     {
@@ -209,6 +212,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            1
+        ],
         "doc_source": "metformin"
     },
     {
@@ -279,6 +285,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            2
+        ],
         "doc_source": "metformin"
     },
     {
@@ -324,6 +333,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            2
+        ],
         "doc_source": "metformin"
     },
     {
@@ -444,6 +456,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            2
+        ],
         "doc_source": "metformin"
     },
     {
@@ -496,6 +511,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            3
+        ],
         "doc_source": "metformin"
     },
     {
@@ -566,6 +584,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            4
+        ],
         "doc_source": "metformin"
     },
     {
@@ -936,6 +957,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            4
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1006,6 +1030,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            5
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1126,6 +1153,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            6
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1346,6 +1376,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            7
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1441,6 +1474,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            8
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1536,6 +1572,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            9
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1681,6 +1720,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            9
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1726,6 +1768,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            10
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1771,6 +1816,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            10
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1816,6 +1864,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            10
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1861,6 +1912,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            11
+        ],
         "doc_source": "metformin"
     },
     {
@@ -1931,6 +1985,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            11
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2001,6 +2058,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            11
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2071,6 +2131,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            12
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2141,6 +2204,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            12
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2236,6 +2302,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            12
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2306,6 +2375,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            13
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2351,6 +2423,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            13
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2396,6 +2471,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            14
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2455,6 +2533,10 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            14,
+            14
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2575,6 +2657,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            14
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2620,6 +2705,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            15
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2665,6 +2753,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            15
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2710,6 +2801,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            15
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2780,6 +2874,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            15
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2925,6 +3022,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            16
+        ],
         "doc_source": "metformin"
     },
     {
@@ -2970,6 +3070,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            17
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3090,6 +3193,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            17
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3135,6 +3241,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            18
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3180,6 +3289,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            18
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3225,6 +3337,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            18
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3295,6 +3410,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            18
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3590,6 +3708,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            19
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3910,6 +4031,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            20
+        ],
         "doc_source": "metformin"
     },
     {
@@ -3980,6 +4104,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            20
+        ],
         "doc_source": "metformin"
     },
     {
@@ -4025,6 +4152,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            21
+        ],
         "doc_source": "metformin"
     },
     {
@@ -4095,6 +4225,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            21
+        ],
         "doc_source": "metformin"
     },
     {
@@ -4390,6 +4523,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            21
+        ],
         "doc_source": "metformin"
     },
     {
@@ -4585,6 +4721,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            22
+        ],
         "doc_source": "metformin"
     },
     {
@@ -4655,6 +4794,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            24
+        ],
         "doc_source": "metformin"
     },
     {
@@ -5225,6 +5367,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            24
+        ],
         "doc_source": "metformin"
     },
     {
@@ -5320,6 +5465,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            25
+        ],
         "doc_source": "metformin"
     },
     {
@@ -5440,6 +5588,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            25
+        ],
         "doc_source": "metformin"
     },
     {
@@ -6010,6 +6161,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            27
+        ],
         "doc_source": "metformin"
     },
     {
@@ -6455,6 +6609,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            28
+        ],
         "doc_source": "metformin"
     },
     {
@@ -6800,6 +6957,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            29
+        ],
         "doc_source": "metformin"
     },
     {
@@ -7295,6 +7455,9 @@
                 "filename": "metformin.pdf"
             }
         },
+        "page_numbers": [
+            30
+        ],
         "doc_source": "metformin"
     }
 ]

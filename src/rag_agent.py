@@ -14,14 +14,16 @@ from typing import (
 )
 from datetime import datetime
 from langchain_core.documents import Document
-import faiss
-from langchain_community.docstore.in_memory import InMemoryDocstore
-from langchain_community.vectorstores import FAISS
 import os
 import openai
 from openai.types.chat import ChatCompletionMessageParam
 
-from pydantic import BaseModel, model_validator, Field
+# Add Weaviate imports
+from weaviate.client import WeaviateAsyncClient
+from weaviate.connect import ConnectionParams
+from weaviate.classes.query import MetadataQuery, HybridFusion
+
+from pydantic import BaseModel, model_validator, Field, SkipValidation
 from typing import Self, Type, TypeVar
 import asyncio
 from itertools import chain  # (used later)
@@ -188,23 +190,28 @@ class RetrievalEvaluation(BaseModel):
 
 
 class QueryDocument(BaseModel):
-    """Represents a single document retrieved from a vector store."""
+    """Represents a single document retrieved from a vector database."""
 
     content: str
-    relevance_score: float = Field(
-        description="The relevance score provided by the similarity search."
+    score: float = Field(
+        description="The score metric from the query (higher means more relevant)."
     )
     doc_id: str = Field(description="Unique identifier for this document chunk.")
     source_name: str = Field(
         description="The name of the source (e.g., 'Lipitor', 'Metformin')."
     )
     metadata: Optional[Dict[str, Any]] = None
-
+    page_numbers: Optional[List[int]] = None
 
 class QueryResult(BaseModel):
     source: str
     query: str
     docs: List[QueryDocument]
+
+class QueryResultList(BaseModel):
+    results: List[QueryResult]
+    id_map: SkipValidation[Optional[Dict[str, str]]] = Field(description="A mapping of document IDs to their indices in the results list.")
+    formatted_results: SkipValidation[Optional[str]] = Field(description="The documents formatted for the answer generation prompt.")
 
 
 class ErrorResult(BaseModel):
@@ -281,74 +288,10 @@ class StatementWithCitations(BaseModel):
 class CitedAnswerResult(BaseModel):
     """A complete answer with structured citations."""
 
-    statements: str = Field(
-        description="answer to the query"
-    )
+    statements: List[StatementWithCitations] = Field(description="answer to the query")
 
-
-class VectorStoreManager:
-    """Manages loading and creation of vector stores."""
-
-    def __init__(self, embedding_model: str = "text-embedding-3-large"):
-        """
-        Initialize the vector store manager.
-
-        Args:
-            embedding_model: Model name for embeddings
-        """
-        self.embeddings = OpenAIEmbeddings(model=embedding_model)
-
-    def load_or_create_store(
-        self, save_path: str, data_path: Optional[str] = None
-    ) -> FAISS:
-        """
-        Load an existing vector store or create a new one if it doesn't exist.
-
-        Args:
-            save_path: Path to save/load the FAISS index
-            data_path: Path to the source data JSON for creation (optional)
-
-        Returns:
-            A FAISS vector store
-        """
-        if os.path.exists(save_path):
-            logger.info(f"Loading existing index from {save_path}")
-            return FAISS.load_local(
-                save_path, self.embeddings, allow_dangerous_deserialization=True
-            )
-        else:
-            if not data_path:
-                raise ValueError(
-                    "Data path must be provided to create a new vector store"
-                )
-
-            logger.info(f"Creating new index at {save_path}")
-            # Create initial index structure
-            index = faiss.IndexFlatL2(len(self.embeddings.embed_query("test")))
-            vector_store = FAISS(
-                embedding_function=self.embeddings,
-                index=index,
-                docstore=InMemoryDocstore(),
-                index_to_docstore_id={},
-            )
-
-            # Load and process chunks
-            chunks = json.load(open(data_path))
-            docs = [
-                Document(
-                    page_content=chunk["contextualized"], metadata=chunk["metadata"]
-                )
-                for chunk in chunks
-            ]
-            uuids = [str(uuid4()) for _ in range(len(docs))]
-
-            # Add documents and save
-            vector_store.add_documents(documents=docs, ids=uuids)
-            vector_store.save_local(save_path)
-            logger.info(f"Index saved to {save_path}")
-
-            return vector_store
-
+    def join_statements(self) -> str:
+        return ' '.join([s.text for s in self.statements])
 
 class PromptManager:
     """
@@ -380,7 +323,7 @@ class PromptManager:
 
 class BaseProcessor:
     """Base class for all LLM-based processors to reduce code duplication."""
-    
+
     def __init__(
         self,
         llm_model: str = "gpt-4o-mini",
@@ -392,14 +335,14 @@ class BaseProcessor:
         self.async_client = async_client
         self.pm = prompt_manager or PromptManager()
         self.parser_service = parser_service or LLMParserService(async_client)
-    
+
     async def _call_llm(
         self,
         prompt_name: str,
         temperature: float = 0.1,
-        response_format: Type[ResponseModel] = Any,
+        response_format: Type[ResponseModel] = Any,  # type: ignore
         default_response: Optional[ResponseModel] = None,
-        **prompt_args
+        **prompt_args,
     ) -> Optional[ResponseModel]:
         """Standardized method for LLM calls using prompt templates."""
         messages = self.pm.messages(prompt_name, **prompt_args)
@@ -597,11 +540,12 @@ class ConversationHistory:
 
 
 class QueryRouter:
-    """Routes queries to appropriate vector stores based on content."""
+    """Routes queries to appropriate Weaviate collections based on content."""
 
     def __init__(
         self,
-        stores: Dict[str, FAISS],
+        weaviate_client: WeaviateAsyncClient,
+        collection_names: List[str],
         llm_model: str = "gpt-4o-mini",
         async_client: openai.AsyncOpenAI = openai.AsyncOpenAI(),
     ):
@@ -609,29 +553,31 @@ class QueryRouter:
         Initialize the query router.
 
         Args:
-            stores: Dictionary mapping store names to FAISS vector stores
+            weaviate_client: Asynchronous Weaviate client
+            collection_names: List of Weaviate collection names
             llm_model: Model name for the routing LLM
             async_client: Shared asynchronous OpenAI client
         """
-        self.stores = stores
+        self.weaviate_client = weaviate_client
+        self.collection_names = collection_names
         self.llm_model = llm_model
         self.async_client = async_client
 
-        # Build tools dynamically based on available stores
+        # Build tools dynamically based on available collections
         self.tools = []
-        for store_name in stores.keys():
+        for collection_name in collection_names:
             self.tools.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": f"query_{store_name.lower()}",
-                        "description": f"Get information about {store_name}",
+                        "name": f"query_{collection_name.lower()}",
+                        "description": f"Get information about {collection_name} from the Weaviate database",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": f"The query from the user (verbatim) that should pertain to {store_name}",
+                                    "description": f"The query from the user (verbatim) that should pertain to {collection_name}",
                                 }
                             },
                             "required": ["query"],
@@ -643,7 +589,7 @@ class QueryRouter:
     @log_timing
     async def route_query_async(self, user_query: str) -> List[QueryResult]:
         """
-        Routes a user query to appropriate vector stores based on content.
+        Routes a user query to appropriate Weaviate collections based on content.
 
         Args:
             user_query: The user's question
@@ -664,7 +610,7 @@ class QueryRouter:
 
             # Log routing destinations
             route_destinations = [
-                self._extract_store_name(tool_call.function.name)
+                self._extract_collection_name(tool_call.function.name)
                 for tool_call in tool_calls
             ]
             logger.info(f"Query routed to: {', '.join(route_destinations)}")
@@ -696,17 +642,9 @@ class QueryRouter:
         )
         return response.choices[0].message.tool_calls
 
-    def _extract_store_name(self, function_name: str) -> str:
-        """Extract and normalize store name from function name."""
+    def _extract_collection_name(self, function_name: str) -> str:
+        """Extract and normalize collection name from function name."""
         return function_name.split("_", 1)[1].capitalize()
-
-    def _get_store(self, store_name: str):
-        """Get the correct store based on name, handling case differences."""
-        normalized_name = store_name.lower()
-        for name, store in self.stores.items():
-            if name.lower() == normalized_name:
-                return store
-        return None
 
     async def _process_tool_call(self, tool_call) -> Optional[QueryResult]:
         """Process a single tool call and return query result."""
@@ -715,117 +653,144 @@ class QueryRouter:
             function_args = json.loads(tool_call.function.arguments)
             query = function_args.get("query")
 
-            store_name = self._extract_store_name(function_name)
-            store = self._get_store(store_name)
+            collection_name = self._extract_collection_name(function_name)
 
-            if not store:
-                logger.warning(f"Store not found for: {store_name}")
+            # Check if collection exists
+            if not await self.weaviate_client.collections.exists(collection_name):
+                logger.warning(f"Collection not found: {collection_name}")
                 return None
 
-            logger.info(f"Routing to {store_name} vector store for query: {query}")
+            logger.info(f"Routing to {collection_name} collection for query: {query}")
 
-            # Get search results
-            search_results = store.similarity_search_with_score(query, k=3)
-            query_docs = self._create_query_documents(search_results, store_name)
+            # Get the Weaviate collection
+            collection = self.weaviate_client.collections.get(collection_name)
 
-            return QueryResult(source=store_name, query=query, docs=query_docs)
+            # Perform hybrid search
+            response = await collection.query.hybrid(
+                query=query,
+                query_properties=["contextualized"],
+                limit=4,
+                alpha=0.65,
+                fusion_type=HybridFusion.RELATIVE_SCORE,
+                return_metadata=MetadataQuery(score=True),
+            )
+
+            # Generate QueryDocument objects from the results
+            query_docs = self._create_query_documents(response.objects, collection_name)
+
+            return QueryResult(source=collection_name, query=query, docs=query_docs)
 
         except Exception as e:
             logger.error(f"Error processing tool call: {e}")
             return None
 
+
     def _create_query_documents(
-        self, search_results, store_name: str
+        self, search_results, collection_name: str
     ) -> List[QueryDocument]:
-        """Create QueryDocument objects from search results."""
+        """Create QueryDocument objects from Weaviate search results."""
         query_docs = []
 
-        for i, (doc, score) in enumerate(search_results):
-            # Extract or generate doc_id
-            doc_id = self._extract_doc_id(doc, store_name, i)
+        for obj in search_results:
+            # Extract the document content
+            content = obj.properties.get("contextualized", "")
+
+            # Extract distance (lower is better)
+            score = obj.metadata.score if obj.metadata else 1.0
+
+            # Use Weaviate UUID as document ID
+            doc_id = str(obj.uuid)
+
+            page_numbers = obj.properties.get("page_numbers", None)
+            # Extract any additional metadata
+            metadata = {
+                k: v for k, v in obj.properties.items() if k != "contextualized"
+            }
 
             query_docs.append(
                 QueryDocument(
-                    content=doc.page_content,
-                    relevance_score=score,
+                    content=content,
+                    score=score,
                     doc_id=doc_id,
-                    metadata=doc.metadata,
-                    source_name=store_name,
+                    metadata=metadata,
+                    source_name=collection_name,
+                    page_numbers=page_numbers,
                 )
             )
         return query_docs
 
-    def _extract_doc_id(self, doc, store_name: str, index: int) -> str:
-        """Extract document ID from metadata or generate a new one."""
-        if hasattr(doc, "metadata") and doc.metadata:
-            doc_id = doc.metadata.get("id") or doc.metadata.get("_id")
-            if doc_id:
-                return str(doc_id)
-
-        return f"{store_name.lower()}_{index}_{uuid4()}"
-
 
 class AnswerGenerator(BaseProcessor):
     """Generates answers from retrieved documents."""
-
-    def _format_documents_for_prompt(self, retrieval_results: List[QueryResult]) -> str:
+    def _format_documents_for_prompt(self, retrieval_results: QueryResultList) -> str:
         """Format documents from retrieval results into a string for the LLM prompt."""
         doc_context = ""
-        for result in retrieval_results:
-            for doc in result.docs:
-                doc_id = doc.doc_id or f"doc_{uuid4()}"
-                doc_context += f"[{doc_id}] Source: {doc.source_name}\n"
-                doc_context += f"Content: {doc.content}\n\n"
+        for result in retrieval_results.results:
+            for i, doc in enumerate(result.docs):
+                doc_id = str(i)#doc.doc_id or f"doc_{uuid4()}"
+                page_numbers = doc.page_numbers
+                doc_context += f"Document ID: [{doc_id}]\n"
+                # Add emphasis phrases based on document position
+                if i == 0:
+                    doc_context += f"MOST RELEVANT Content: {doc.content}\n"
+                elif i == 1:
+                    doc_context += f"VERY RELEVANT Content: {doc.content}\n"
+                elif i == 2:
+                    doc_context += f"RELEVANT Content: {doc.content}\n"
+                else:
+                    doc_context += f"Content: {doc.content}\n"
+                doc_context += f"Source: {doc.source_name}\n"
+                doc_context += f"Page Numbers: {page_numbers}\n"
         return doc_context
 
-    # def _validate_citations(
-    #     self, cited_answer: CitedAnswerResult, retrieval_results: List[QueryResult]
-    # ):
-    #     """Validate citations in the answer against retrieved documents using fuzzy matching."""
-    #     # Create a document lookup map for efficient access
-    #     doc_map = {}
-    #     for result in retrieval_results:
-    #         for doc in result.docs:
-    #             doc_map[doc.doc_id] = doc
+    def _validate_citations(
+        self, cited_answer: CitedAnswerResult, retrieval_results: QueryResultList
+    ):
+        """Validate citations in the answer against retrieved documents using fuzzy matching."""
+        # Create a document lookup map for efficient access
+        doc_map = {}
+        for result in retrieval_results:
+            for doc in result.docs:
+                doc_map[doc.doc_id] = doc
 
-    #     match_threshold = 85  # Adjust as needed - higher is stricter
+        match_threshold = 85  # Adjust as needed - higher is stricter
 
-    #     for statement in cited_answer.statements:
-    #         for citation in statement.citations:
-    #             # Direct lookup instead of nested loops
-    #             if citation.doc_id in doc_map:
-    #                 doc = doc_map[citation.doc_id]
-    #                 # Use partial_ratio for best substring matching
-    #                 similarity = fuzz.partial_ratio(citation.quote, doc.content)
-    #                 if similarity >= match_threshold:
-    #                     logger.debug(f"Citation validated with {similarity}% match")
-    #                 else:
-    #                     logger.warning(
-    #                         f"Citation failed validation: {similarity}% match below threshold of {match_threshold}%"
-    #                     )
-    #                     logger.debug(f"Quote: '{citation.quote[:50]}...'")
-    #             else:
-    #                 logger.warning(
-    #                     f"Invalid citation: doc_id={citation.doc_id}, source={citation.source_name} - document not found"
-    #                 )
+        for statement in cited_answer.statements:
+            for citation in statement.citations:
+                # Direct lookup instead of nested loops
+                if citation.doc_id in doc_map:
+                    doc = doc_map[citation.doc_id]
+                    # Use partial_ratio for best substring matching
+                    similarity = fuzz.partial_ratio(citation.quote, doc.content)
+                    if similarity >= match_threshold:
+                        logger.debug(f"Citation validated with {similarity}% match")
+                    else:
+                        logger.warning(
+                            f"Citation failed validation: {similarity}% match below threshold of {match_threshold}%"
+                        )
+                        logger.debug(f"Quote: '{citation.quote[:50]}...'")
+                else:
+                    logger.warning(
+                        f"Invalid citation: doc_id={citation.doc_id}, source={citation.source_name} - document not found"
+                    )
 
     @log_timing
     async def generate_answer_async(
         self,
         user_question: str,
-        retrieval_results: List[QueryResult],
+        retrieval_results: QueryResultList,
         conversation_context: str = "",
     ) -> CitedAnswerResult:
         """Generates an answer with citations from retrieved documents."""
         if not retrieval_results:
-            return CitedAnswerResult(statements="")
-            
+            return CitedAnswerResult(statements=[])
+
         # Format documents for the prompt
         doc_context = self._format_documents_for_prompt(retrieval_results)
-        
+
         logger.info(f"Generating cited answer for query: '{user_question}'")
-        default_response = CitedAnswerResult(statements="")
-        
+        default_response = CitedAnswerResult(statements=[])
+
         # Use the base class _call_llm method instead of direct calls
         response = await self._call_llm(
             prompt_name="answer_generation",
@@ -840,8 +805,8 @@ class AnswerGenerator(BaseProcessor):
         if response is None:
             return default_response
 
-        # Validate citations against source documents
-        #self._validate_citations(response, retrieval_results)
+        #Validate citations against source documents
+        self._validate_citations(response, retrieval_results)
         return response
 
 
@@ -922,11 +887,13 @@ class RetrievalEvaluator(BaseProcessor):
             response_format=RetrievalEvaluation,
             default_response=RetrievalEvaluation(
                 is_sufficient=True, missing_information="", additional_queries=[]
-            )
+            ),
         )
 
         # Process evaluation result
-        enhanced_results = list(retrieval_results)  # Create a copy to avoid modifying the original
+        enhanced_results = list(
+            retrieval_results
+        )  # Create a copy to avoid modifying the original
 
         if (
             evaluation
@@ -993,19 +960,19 @@ class ConversationContextProcessor(BaseProcessor):
             explanation="No relevant context found",
             relevant_snippets="",
         )
-        
+
         response = await self._call_llm(
             prompt_name="context_extraction",
-            current_query=query, 
+            current_query=query,
             history_text=history_text,
             temperature=0.1,
             response_format=RelevantHistoryContext,
             default_response=default_response,
         )
-        
+
         if response is None:
             return default_response
-            
+
         return response
 
 
@@ -1045,7 +1012,7 @@ class FollowUpQuestionsGenerator(BaseProcessor):
 
         # Use the base class _call_llm method instead of direct calls to parser_service
         default_response = FollowUpQuestions(questions=[])
-        
+
         response = await self._call_llm(
             prompt_name="follow_up_questions",
             original_query=query,
@@ -1064,13 +1031,14 @@ class FollowUpQuestionsGenerator(BaseProcessor):
 
 class MedicalRAG:
     """
-    A medical RAG system that integrates vector stores, query routing, answer generation,
+    A medical RAG system that integrates Weaviate, query routing, answer generation,
     and conversation history.
     """
 
     def __init__(
         self,
-        vector_stores: Dict[str, FAISS],
+        weaviate_client: WeaviateAsyncClient,
+        collection_names: List[str],
         llm_model: str = "gpt-4o-mini",
         parser_service: Optional[LLMParserService] = None,
         conversation_history_dir: str = "data/conversations",
@@ -1078,9 +1046,10 @@ class MedicalRAG:
     ):
         """
         Initialize the Medical RAG system with a simplified configuration.
-        
+
         Args:
-            vector_stores: Dictionary mapping store names to FAISS vector stores
+            weaviate_client: The Weaviate async client
+            collection_names: Names of collections in Weaviate to query
             llm_model: Single model name used for all LLM components
             parser_service: Service for making parsed LLM calls
             conversation_history_dir: Directory to store conversation histories
@@ -1090,28 +1059,32 @@ class MedicalRAG:
         self.async_client = openai.AsyncOpenAI()
         self.prompt_manager = PromptManager(prompts_dir)
         self.parser_service = parser_service or LLMParserService(self.async_client)
-        
-        # Initialize the router (special case as it doesn't use BaseProcessor)
+
+        # Store the Weaviate client
+        self.weaviate_client = weaviate_client
+
+        # Initialize the router with Weaviate client and collection names
         self.router = QueryRouter(
-            vector_stores, 
-            llm_model, 
-            self.async_client
+            weaviate_client=weaviate_client,
+            collection_names=collection_names,
+            llm_model=llm_model,
+            async_client=self.async_client,
         )
-        
+
         # All BaseProcessor components share the same model and resources
         common_args = {
             "llm_model": llm_model,
             "async_client": self.async_client,
             "prompt_manager": self.prompt_manager,
-            "parser_service": self.parser_service
+            "parser_service": self.parser_service,
         }
-        
+
         self.generator = AnswerGenerator(**common_args)
         self.preprocessor = QueryPreprocessor(**common_args)
         self.evaluator = RetrievalEvaluator(**common_args)
         self.context_processor = ConversationContextProcessor(**common_args)
         self.follow_up_generator = FollowUpQuestionsGenerator(**common_args)
-        
+
         # Initialize conversation history
         self.conversation_history = ConversationHistory(conversation_history_dir)
 
@@ -1137,17 +1110,17 @@ class MedicalRAG:
         """
         Simple method to process a user query and return an answer.
         Tests all components in the pipeline to ensure prompts work with special characters.
-        
+
         Args:
             user_id: Unique identifier for the user
             user_query: The user's question
             use_history: Whether to use conversation history
-            
+
         Returns:
             CitedAnswerResult with the answer
         """
         logger.info(f"Processing query for user '{user_id}': '{user_query}'")
-        
+
         # Get conversation context if needed
         conversation_context = ""
         if use_history:
@@ -1159,128 +1132,148 @@ class MedicalRAG:
                     user_query, history
                 )
                 conversation_context = ctx_result.relevant_snippets
-                logger.info(f"Context extraction result: required={ctx_result.required_context}")
+                logger.info(
+                    f"Context extraction result: required={ctx_result.required_context}"
+                )
+
+        # # Step 1: Clarify query
+        # clarified = await self.preprocessor.clarify_query_async(
+        #     user_query, conversation_context
+        # )
+        # logger.info(f"Clarification result: level={clarified.ambiguity_level}")
+
+        # # Step 2: Decompose query
+        # decomposed = await self.preprocessor.decompose_query_async(
+        #     clarified.clarified_query
+        # )
+        # logger.info(f"Decomposition result: complexity={decomposed.query_complexity}")
+
+        # # Use decomposed queries if available
+        # queries = (
+        #     decomposed.decomposed_query
+        #     if decomposed.query_complexity == "complex"
+        #     else [clarified.clarified_query]
+        # )
         
-        # Step 1: Clarify query
-        clarified = await self.preprocessor.clarify_query_async(
-            user_query, conversation_context
-        )
-        logger.info(f"Clarification result: level={clarified.ambiguity_level}")
-        
-        # Step 2: Decompose query
-        decomposed = await self.preprocessor.decompose_query_async(
-            clarified.clarified_query
-        )
-        logger.info(f"Decomposition result: complexity={decomposed.query_complexity}")
-        
-        # Use decomposed queries if available
-        queries = (
-            decomposed.decomposed_query 
-            if decomposed.query_complexity == "complex"
-            else [clarified.clarified_query]
-        )
-        if not queries:
-            queries = [clarified.clarified_query]  # Fallback
-        
+        #if not queries:
+        queries = [user_query]#[clarified.clarified_query]  # Fallback
+
         # Step 3: Route queries to retrieve documents
         results_list = await asyncio.gather(
             *[self.router.route_query_async(q) for q in queries]
         )
-        
+
         # Flatten results
-        retrieval_results = list(chain.from_iterable(results_list))
-        logger.info(f"Retrieved {len(retrieval_results)} results")
-        
-        # Step 4: Evaluate retrieval results
-        if retrieval_results:
-            evaluated_results = await self.evaluator.evaluate_retrieval(
-                user_query, 
-                clarified.clarified_query,
-                retrieval_results,
-                self.router
-            )
-            logger.info(f"Evaluation completed, final document count: {sum(len(r.docs) for r in evaluated_results)}")
-        else:
-            evaluated_results = []
-        
+        retrieval_results = QueryResultList(results=list(chain.from_iterable(results_list)),id_map={},formatted_results=None)
+        logger.info(f"Retrieved {len(retrieval_results.results)} results")
+
+        # # Step 4: Evaluate retrieval results
+        # if retrieval_results:
+        #     evaluated_results = await self.evaluator.evaluate_retrieval(
+        #         user_query, user_query, retrieval_results, self.router
+        #     )
+        #     logger.info(
+        #         f"Evaluation completed, final document count: {sum(len(r.docs) for r in evaluated_results)}"
+        #     )
+        # else:
+        #     evaluated_results = []
+
         # Step 5: Generate answer
         answer = await self.generator.generate_answer_async(
-            clarified.clarified_query, 
-            evaluated_results, 
-            conversation_context
+            user_query, retrieval_results, conversation_context
         )
         logger.info("Answer generated")
-        
+        print(answer.join_statements())
         # Step 6: Generate follow-up questions
         follow_ups = await self.follow_up_generator.generate_follow_up_questions(
-            clarified.clarified_query,
-            answer.statements,
-            self.conversation_history.get_history(user_id) if use_history else None
+            user_query,
+            answer.join_statements(),
+            self.conversation_history.get_history(user_id) if use_history else None,
         )
         logger.info(f"Generated {len(follow_ups.questions)} follow-up questions")
-        
+
         # Save to conversation history
-        self.conversation_history.add_entry(
-            user_id, user_query, answer.statements
-        )
-        
+        self.conversation_history.add_entry(user_id, user_query, answer.join_statements())
+
         return answer
 
 
 # Application setup and usage
-def setup_medical_rag() -> MedicalRAG:
+async def setup_medical_rag() -> MedicalRAG:
     """Set up and return a configured MedicalRAG instance."""
-    # Initialize vector store manager
-    store_manager = VectorStoreManager()
+    # Define default Weaviate connection parameters
+    weaviate_host = os.getenv("WEAVIATE_HOST", "127.0.0.1")
+    weaviate_port = int(os.getenv("WEAVIATE_PORT", "8080"))
+    weaviate_grpc_port = int(os.getenv("WEAVIATE_GRPC_PORT", "50051"))
 
-    # Define paths
-    lipitor_save_path = "data/faiss_lipitor_index"
-    metformin_save_path = "data/faiss_metformin_index"
-    lipitor_data_path = "data/chunks_lipitor.json"
-    metformin_data_path = "data/chunks_metformin.json"
+    # Get OpenAI API key
+    openai_key = os.getenv("OPENAI_APIKEY")
+    if not openai_key:
+        logger.error("OPENAI_APIKEY environment variable not set.")
+        raise ValueError("OPENAI_APIKEY environment variable not set.")
 
-    # Load or create vector stores
-    lipitor_store = store_manager.load_or_create_store(
-        lipitor_save_path, lipitor_data_path
+    # Set up headers for OpenAI
+    headers = {"X-OpenAI-Api-Key": openai_key}
+
+    logger.info(f"Connecting to Weaviate at {weaviate_host}:{weaviate_port}")
+
+    # Create and connect to Weaviate client
+    client = WeaviateAsyncClient(
+        connection_params=ConnectionParams.from_params(
+            http_host=weaviate_host,
+            http_port=weaviate_port,
+            http_secure=False,
+            grpc_host=weaviate_host,
+            grpc_port=weaviate_grpc_port,
+            grpc_secure=False,
+        ),
+        additional_headers=headers,
     )
-    metformin_store = store_manager.load_or_create_store(
-        metformin_save_path, metformin_data_path
+
+    # Connect to Weaviate
+    await client.connect()
+    logger.info("Connected to Weaviate successfully")
+
+    # Define collection names to use (previously FAISS store names)
+    collection_names = ["Lipitor", "Metformin"]
+
+    # Create and return MedicalRAG instance
+    return MedicalRAG(
+        weaviate_client=client,
+        collection_names=collection_names,
+        llm_model="gpt-4o-mini",
     )
-
-    # Create vector store dictionary
-    vector_stores = {"Lipitor": lipitor_store, "Metformin": metformin_store}
-
-    # Create and return MedicalRAG instance with a single model
-    return MedicalRAG(vector_stores, llm_model="gpt-4o-mini")
-
-
-
 
 
 # Example usage
 if __name__ == "__main__":
     # Configure more verbose logging for the example run
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG)
     logger.info("Starting Medical RAG example")
 
-    # Set up the medical RAG system
-    medical_rag = setup_medical_rag()
-    logger.info("Medical RAG system initialized")
+    async def main():
+        # Set up the medical RAG system
+        medical_rag = await setup_medical_rag()
+        logger.info("Medical RAG system initialized")
 
-    # Simulate a conversation with a user
-    user_id = "test_user"
+        # Simulate a conversation with a user
+        user_id = "test_user"
 
-    # Simple test query
-    test_query = "What are the common side effects of Lipitor?"
-    logger.info(f"Testing with query: '{test_query}'")
-    
-    # Process the query and measure time
-    start_time = time.time()
-    answer = medical_rag.process_query_simple(user_id, test_query)
-    elapsed = time.time() - start_time
-    
-    # Display results
-    logger.info(f"Query processed in {elapsed:.2f}s")
-    logger.info(f"Answer: {answer}")
-    
+        # Simple test query
+        test_query = "how do these compare to metformin?"
+        logger.info(f"Testing with query: '{test_query}'")
 
+        # Process the query and measure time
+        start_time = time.time()
+        answer = await medical_rag.process_query_simple(user_id, test_query)
+        elapsed = time.time() - start_time
+
+        # Display results
+        logger.info(f"Query processed in {elapsed:.2f}s")
+        logger.info(f"Answer: {answer}")
+
+        # Close the Weaviate client
+        await medical_rag.weaviate_client.close()
+
+    # Run the async main function
+    asyncio.run(main())
