@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 # +++++ NEW IMPORTS +++++++++++++++++++++++++++++++++++++++++++++++++++
 from rag_agent import (
+    AnswerGenerationResult,
+    QueryResultList,
     setup_medical_rag,
     MedicalRAG,
     ClarifiedQuery,
@@ -113,8 +115,8 @@ class RAGOrchestrator:
         return await self.medical_rag.router.route_query_async(query)
 
     async def _evaluate_retrieval(
-        self, query: str, results: list[QueryResult]
-    ) -> list[QueryResult]:
+        self, query: str, results: QueryResultList
+    ) -> QueryResultList:
         return await self.medical_rag.evaluator.evaluate_retrieval(
             original_query=query,
             clarified_query=query,
@@ -122,14 +124,16 @@ class RAGOrchestrator:
             router=self.medical_rag.router,
         )
 
-    async def _summarize(self, query: str, history: list[ConversationEntry]) -> RelevantHistoryContext:
+    async def _summarize(
+        self, query: str, history: list[ConversationEntry]
+    ) -> RelevantHistoryContext:
         return await self.medical_rag.context_processor.extract_relevant_context(
             query=query, conversation_history=history
         )
 
     async def _answer(
-        self, results: list[QueryResult], query: str, summary: RelevantHistoryContext
-    ) -> CitedAnswerResult:
+        self, results: QueryResultList, query: str, summary: RelevantHistoryContext
+    ) -> AnswerGenerationResult:
         return await self.medical_rag.generator.generate_answer_async(
             user_question=query,
             retrieval_results=results,
@@ -141,9 +145,13 @@ class RAGOrchestrator:
     ) -> CitedAnswerResult | None:
         self.user_id = user_id
         processed_history = self.medical_rag.conversation_history.get_history(user_id)
-        print(f"Orchestrator: Fetched {len(processed_history)} history entries for user '{user_id}'")
+        print(
+            f"Orchestrator: Fetched {len(processed_history)} history entries for user '{user_id}'"
+        )
 
-        history_context_str = self.medical_rag.conversation_history.get_context_from_history(user_id)
+        history_context_str = (
+            self.medical_rag.conversation_history.get_context_from_history(user_id)
+        )
         if history_context_str:
             print(f"Orchestrator: Using history context string for clarification.")
         else:
@@ -163,10 +171,12 @@ class RAGOrchestrator:
         if best_answer and self.user_id:
             print(f"Orchestrator: Adding result to history for user '{self.user_id}'")
             self.medical_rag.conversation_history.add_entry(
-                self.user_id, user_query, best_answer.statements
+                self.user_id, user_query, best_answer
             )
         elif self.user_id:
-             print(f"Orchestrator: No final answer found, not adding to history for user '{self.user_id}'")
+            print(
+                f"Orchestrator: No final answer found, not adding to history for user '{self.user_id}'"
+            )
 
         return best_answer
 
@@ -189,7 +199,9 @@ class RAGOrchestrator:
         branch.add_task(task_name, task)
         self.active_tasks[task] = branch.branch_id
 
-    def _launch_initial_tasks(self, branch: ProcessingBranch, query: str, history_context_str: str):
+    def _launch_initial_tasks(
+        self, branch: ProcessingBranch, query: str, history_context_str: str
+    ):
         self._launch_task(branch, "clarify", self._clarify(query, history_context_str))
         self._launch_task(branch, "decompose", self._decompose(query))
         self._launch_task(branch, "retrieve", self._retrieve(query))
@@ -336,15 +348,15 @@ class RAGOrchestrator:
                 nb = self._create_branch(q, f"decomposed_{i}", branch.branch_id)
                 self._launch_task(nb, "retrieve", self._retrieve(q))
 
-    async def _handle_retrieve_result(self, results: list[QueryResult], branch):
-        print(f"  Retrieved {sum(len(r.docs) for r in results)} docs")
+    async def _handle_retrieve_result(self, results: QueryResultList, branch):
+        print(f"  Retrieved {sum(len(r.docs) for r in results.results)} docs")
         branch.retrieved_results = results
         branch.merged_results = results
         self._launch_task(
             branch, "evaluate", self._evaluate_retrieval(branch.query, results)
         )
 
-    async def _handle_evaluate_result(self, merged: list[QueryResult], branch):
+    async def _handle_evaluate_result(self, merged: QueryResultList, branch):
         branch.merged_results = merged
         if self.summary_result is not None:
             self._launch_task(
@@ -353,7 +365,7 @@ class RAGOrchestrator:
                 self._answer(merged, branch.query, self.summary_result),
             )
 
-    async def _handle_answer_result(self, ans: CitedAnswerResult, branch):
+    async def _handle_answer_result(self, ans: AnswerGenerationResult, branch):
         branch.final_answer = ans
         branch.status = BranchStatus.COMPLETED
         self.final_answer_source_branch_id = branch.branch_id
@@ -375,13 +387,20 @@ class RAGOrchestrator:
                     "answer",
                     self._answer(b.merged_results, b.query, self.summary_result),
                 )
-            elif b.status == BranchStatus.ACTIVE and "answer" not in b.tasks and self.summary_result is None:
-                 print(f"Branch {b.branch_id} waiting for summary before triggering answer.")
+            elif (
+                b.status == BranchStatus.ACTIVE
+                and "answer" not in b.tasks
+                and self.summary_result is None
+            ):
+                print(
+                    f"Branch {b.branch_id} waiting for summary before triggering answer."
+                )
 
     # +++++ Branch scoring helpers ++++++++++++++++++++++++++++++++++++++++
     @dataclass(frozen=True)
     class BranchTraits:
         """Binary traits that capture how a branch refined the original query."""
+
         clarified: bool
         decomposed: bool
         gap_filled: bool
@@ -394,14 +413,13 @@ class RAGOrchestrator:
                 int(self.gap_filled),
             )
 
-    def _compute_branch_traits(self, branch: ProcessingBranch) -> "RAGOrchestrator.BranchTraits":
+    def _compute_branch_traits(
+        self, branch: ProcessingBranch
+    ) -> "RAGOrchestrator.BranchTraits":
         """Derive refinement traits for a given branch."""
-        clarified = (
-            branch.branch_type == "clarified"
-            or (
-                branch.parent_id is not None
-                and self.branches[branch.parent_id].branch_type == "clarified"
-            )
+        clarified = branch.branch_type == "clarified" or (
+            branch.parent_id is not None
+            and self.branches[branch.parent_id].branch_type == "clarified"
         )
         decomposed = branch.branch_type.startswith("decomposed")
         gap_filled = (
@@ -429,7 +447,9 @@ class RAGOrchestrator:
             )
 
         completed_branches = [
-            b for b in self.branches.values() if b.status == BranchStatus.COMPLETED and b.final_answer is not None
+            b
+            for b in self.branches.values()
+            if b.status == BranchStatus.COMPLETED and b.final_answer is not None
         ]
         if not completed_branches:
             print("No completed branch found with an answer.")
@@ -467,10 +487,13 @@ if __name__ == "__main__":
         print("Medical RAG System Initialized.")
 
         test_user_id = "orchestrator_test_user_1"
-        history_path = Path(medical_rag_instance.conversation_history.save_directory) / f"{test_user_id}.json"
+        history_path = (
+            Path(medical_rag_instance.conversation_history.save_directory)
+            / f"{test_user_id}.json"
+        )
         if history_path.exists():
-             print(f"Removing existing history file: {history_path}")
-             history_path.unlink()
+            print(f"Removing existing history file: {history_path}")
+            history_path.unlink()
         medical_rag_instance.conversation_history._load_conversation(test_user_id)
 
         try:

@@ -11,12 +11,14 @@ from typing import (
     Tuple,
     NamedTuple,
     Literal,
+    AsyncGenerator,
 )
 from datetime import datetime
 from langchain_core.documents import Document
 import os
 import openai
 from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 
 # Add Weaviate imports
 from weaviate.client import WeaviateAsyncClient
@@ -30,10 +32,11 @@ from itertools import chain  # (used later)
 import logging
 import time
 from pydantic.json_schema import SkipJsonSchema
-from fuzzywuzzy import fuzz
+from fuzzywuzzy import fuzz, process as fuzzy_process
 import yaml
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from pathlib import Path
+import re  # Make sure this import is present at the top of the file
 
 # Set up logging
 logging.basicConfig(
@@ -107,14 +110,18 @@ class LLMParserService:
             logger.debug(
                 f"Calling LLM (model={model}, temp={temperature}, response_format={format_name})"
             )
+            params = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "response_format": response_format,
+            }
+            if model == "o3-mini":
+                # remove temperature
+                params.pop("temperature")
 
             # The .parse() method directly returns the parsed Pydantic model or None
-            response = await self.async_client.beta.chat.completions.parse(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                response_format=response_format,
-            )
+            response = await self.async_client.beta.chat.completions.parse(**params)
             parsed_response = response.choices[0].message.parsed
 
             if parsed_response is None:
@@ -203,15 +210,15 @@ class QueryDocument(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     page_numbers: Optional[List[int]] = None
 
+
 class QueryResult(BaseModel):
     source: str
     query: str
     docs: List[QueryDocument]
 
+
 class QueryResultList(BaseModel):
     results: List[QueryResult]
-    id_map: SkipValidation[Optional[Dict[str, str]]] = Field(description="A mapping of document IDs to their indices in the results list.")
-    formatted_results: SkipValidation[Optional[str]] = Field(description="The documents formatted for the answer generation prompt.")
 
 
 class ErrorResult(BaseModel):
@@ -283,15 +290,15 @@ class StatementWithCitations(BaseModel):
     citations: List[Citation] = Field(
         description="Citations supporting this statement."
     )
-
+    linebreaks: Literal["\\n", "\\n\\n", ""] = Field(
+        description="The linebreaks or other formatting in the statement. If there are no linebreaks, return an empty string."
+    )
 
 class CitedAnswerResult(BaseModel):
     """A complete answer with structured citations."""
 
     statements: List[StatementWithCitations] = Field(description="answer to the query")
 
-    def join_statements(self) -> str:
-        return ' '.join([s.text for s in self.statements])
 
 class PromptManager:
     """
@@ -353,6 +360,24 @@ class BaseProcessor:
             response_format=response_format,
             default_response=default_response,
         )
+
+    async def _call_llm_completions(
+        self,
+        prompt_name: str,
+        temperature: float = 0.1,
+        default_response: str = "",
+        **prompt_args,
+    ) -> str:
+        """Standardized method for LLM streaming using prompt templates."""
+        messages = self.pm.messages(prompt_name, **prompt_args)
+        response = await self.async_client.chat.completions.create(
+            model=self.llm_model,
+            messages=messages,
+            temperature=temperature,
+        )
+        if response.choices[0].message.content is None:
+            return default_response
+        return response.choices[0].message.content
 
 
 class QueryPreprocessor(BaseProcessor):
@@ -684,7 +709,6 @@ class QueryRouter:
             logger.error(f"Error processing tool call: {e}")
             return None
 
-
     def _create_query_documents(
         self, search_results, collection_name: str
     ) -> List[QueryDocument]:
@@ -720,59 +744,62 @@ class QueryRouter:
         return query_docs
 
 
+class AnswerGenerationResult(BaseModel):
+    plain_answer: str
+    retrieval_results: QueryResultList
+    formatted_docs: str
+    prompt_id_map: Dict[str, str]
+    user_question: str
+    conversation_context: str
+
+
 class AnswerGenerator(BaseProcessor):
     """Generates answers from retrieved documents."""
-    def _format_documents_for_prompt(self, retrieval_results: QueryResultList) -> str:
-        """Format documents from retrieval results into a string for the LLM prompt."""
+
+    def _format_documents_for_prompt(
+        self, retrieval_results: QueryResultList
+    ) -> Tuple[str, Dict[str, str]]:
         doc_context = ""
+        prompt_id_to_original_id_map: Dict[str, str] = {}
+        doc_index = 0
+
+        if not retrieval_results or not retrieval_results.results:
+            return "", {}
+
         for result in retrieval_results.results:
-            for i, doc in enumerate(result.docs):
-                doc_id = str(i)#doc.doc_id or f"doc_{uuid4()}"
-                page_numbers = doc.page_numbers
-                doc_context += f"Document ID: [{doc_id}]\n"
-                # Add emphasis phrases based on document position
-                if i == 0:
-                    doc_context += f"MOST RELEVANT Content: {doc.content}\n"
-                elif i == 1:
-                    doc_context += f"VERY RELEVANT Content: {doc.content}\n"
-                elif i == 2:
-                    doc_context += f"RELEVANT Content: {doc.content}\n"
-                else:
-                    doc_context += f"Content: {doc.content}\n"
-                doc_context += f"Source: {doc.source_name}\n"
-                doc_context += f"Page Numbers: {page_numbers}\n"
-        return doc_context
-
-    def _validate_citations(
-        self, cited_answer: CitedAnswerResult, retrieval_results: QueryResultList
-    ):
-        """Validate citations in the answer against retrieved documents using fuzzy matching."""
-        # Create a document lookup map for efficient access
-        doc_map = {}
-        for result in retrieval_results:
             for doc in result.docs:
-                doc_map[doc.doc_id] = doc
+                original_doc_id = doc.doc_id or f"missing_id_{uuid4()}"
+                prompt_doc_id = f"doc_{doc_index + 1}"
+                prompt_id_to_original_id_map[prompt_doc_id] = original_doc_id
 
-        match_threshold = 85  # Adjust as needed - higher is stricter
+                doc_context += f"Document ID: [{prompt_doc_id}]\n"
+                doc_context += f"Content: {doc.content}\n"
+                doc_context += f"Source: {doc.source_name}\n"
+                if doc.page_numbers:
+                    doc_context += f"Page Numbers: {doc.page_numbers}\n"
+                doc_context += "---\n"
+                doc_index += 1
 
-        for statement in cited_answer.statements:
-            for citation in statement.citations:
-                # Direct lookup instead of nested loops
-                if citation.doc_id in doc_map:
-                    doc = doc_map[citation.doc_id]
-                    # Use partial_ratio for best substring matching
-                    similarity = fuzz.partial_ratio(citation.quote, doc.content)
-                    if similarity >= match_threshold:
-                        logger.debug(f"Citation validated with {similarity}% match")
-                    else:
-                        logger.warning(
-                            f"Citation failed validation: {similarity}% match below threshold of {match_threshold}%"
-                        )
-                        logger.debug(f"Quote: '{citation.quote[:50]}...'")
-                else:
-                    logger.warning(
-                        f"Invalid citation: doc_id={citation.doc_id}, source={citation.source_name} - document not found"
-                    )
+        return doc_context.strip(), prompt_id_to_original_id_map
+
+    def _create_result(
+        self,
+        plain_answer: str,
+        retrieval_results: QueryResultList,
+        formatted_docs: str = "",
+        prompt_id_map: Optional[Dict[str, str]] = None,
+        user_question: str = "",
+        conversation_context: str = "",
+    ) -> AnswerGenerationResult:
+        """Helper method to create AnswerGenerationResult with provided values."""
+        return AnswerGenerationResult(
+            plain_answer=plain_answer,
+            retrieval_results=retrieval_results,
+            formatted_docs=formatted_docs,
+            prompt_id_map=prompt_id_map or {},
+            user_question=user_question,
+            conversation_context=conversation_context,
+        )
 
     @log_timing
     async def generate_answer_async(
@@ -780,34 +807,363 @@ class AnswerGenerator(BaseProcessor):
         user_question: str,
         retrieval_results: QueryResultList,
         conversation_context: str = "",
-    ) -> CitedAnswerResult:
-        """Generates an answer with citations from retrieved documents."""
-        if not retrieval_results:
-            return CitedAnswerResult(statements=[])
+    ) -> AnswerGenerationResult:
+        """
+        Generates a plain text answer and packages it with context for validation.
+        """
+        default_error_answer = "I'm sorry, I don't know the answer to that question."
 
-        # Format documents for the prompt
-        doc_context = self._format_documents_for_prompt(retrieval_results)
+        # Initialize result with common parameters
+        result = AnswerGenerationResult(
+            plain_answer=default_error_answer,
+            retrieval_results=retrieval_results or QueryResultList(results=[]),
+            formatted_docs="",
+            prompt_id_map={},
+            user_question=user_question,
+            conversation_context=conversation_context,
+        )
 
-        logger.info(f"Generating cited answer for query: '{user_question}'")
-        default_response = CitedAnswerResult(statements=[])
+        if not retrieval_results or not retrieval_results.results:
+            logger.warning("No retrieval results provided.")
+            return result
 
-        # Use the base class _call_llm method instead of direct calls
-        response = await self._call_llm(
+        # Format documents for the prompt and get the ID map
+        formatted_docs, prompt_id_map = self._format_documents_for_prompt(
+            retrieval_results
+        )
+
+        # Update result with formatted docs and prompt ID map
+        result.formatted_docs = formatted_docs
+        result.prompt_id_map = prompt_id_map
+
+        if not formatted_docs:
+            logger.warning("Formatted documents are empty.")
+            result.plain_answer = "I encountered an issue processing the information."
+            return result
+
+        logger.info(f"Generating plain text answer for query: '{user_question}'")
+
+        # Generate the plain answer string
+        plain_answer = await self._call_llm_completions(
             prompt_name="answer_generation",
             user_question=user_question,
-            doc_context=doc_context,
-            conversation_context=conversation_context,
-            temperature=0.0,  # Low temperature for factual accuracy
-            response_format=CitedAnswerResult,
-            default_response=default_response,
+            retrieval_results=formatted_docs,
+            conversation_context=conversation_context or "",
+            temperature=0.1,
+            default_response=default_error_answer,
         )
-        logger.info(f"Answer generation response: {response}")
-        if response is None:
-            return default_response
 
-        #Validate citations against source documents
-        self._validate_citations(response, retrieval_results)
-        return response
+        # Update result with generated answer
+        result.plain_answer = plain_answer
+
+        return result
+
+
+class AnswerValidator(BaseProcessor):
+    """
+    Structures a plain text answer using LLM and validates its citations
+    against the original retrieved documents.
+    """
+
+    def _find_document_by_id(
+        self, doc_id: str, retrieval_results: QueryResultList
+    ) -> Optional[QueryDocument]:
+        """Finds a QueryDocument within the QueryResultList by its original ID."""
+        for result in retrieval_results.results:
+            for doc in result.docs:
+                if doc.doc_id == doc_id:
+                    return doc
+        return None
+
+    def _verify_quote(
+        self, quote: str, document_content: str, threshold: int = 85
+    ) -> bool:
+        """Verifies if the quote exists in the document content using fuzzy matching."""
+        if not quote or not document_content:
+            return False
+        if quote in document_content:
+            return True
+        # Ensure fuzzywuzzy is imported: from fuzzywuzzy import process as fuzzy_process
+        match_result = fuzzy_process.extractOne(
+            quote, [document_content], score_cutoff=threshold
+        )
+        return match_result is not None
+
+    def _resolve_citation_ids(
+        self, answer: CitedAnswerResult, prompt_id_map: Dict[str, str]
+    ) -> CitedAnswerResult:
+        """
+        Resolves temporary prompt IDs (e.g., 'doc_1') in citations back to
+        original document IDs using the provided map.
+        """
+        for statement in answer.statements:
+            for citation in statement.citations:
+                prompt_id = citation.doc_id  # Expecting [doc_X] from structuring LLM
+                original_id = prompt_id_map.get(prompt_id)  # Use the correct map here
+                if original_id:
+                    citation.doc_id = original_id
+                else:
+                    logger.warning(
+                        f"Could not resolve prompt ID '{prompt_id}' during validation. Citation will likely fail."
+                    )
+                    # Keep the invalid prompt_id; validation check below will fail anyway if doc not found
+        return answer
+
+    def _validate_citations_and_build_answer(
+        self,
+        structured_answer,
+        retrieval_results,
+        original_id_to_prompt_id_map,
+        quote_match_threshold=85,
+    ):
+        """Validates citations and builds final answer with validated statements."""
+        if not structured_answer or not structured_answer.statements:
+            return self._get_fallback_message()
+
+        validated_statements = []
+        stats = {"total_checked": 0, "invalid_count": 0}
+
+        for idx, statement in enumerate(structured_answer.statements):
+            processed_statement = self._process_statement(
+                statement,
+                idx,
+                retrieval_results,
+                original_id_to_prompt_id_map,
+                quote_match_threshold,
+                stats,
+            )
+            if processed_statement:
+                validated_statements.append(processed_statement)
+
+        logger.info(
+            f"Citation check summary: Total checked: {stats['total_checked']}, Individual citation failures: {stats['invalid_count']}"
+        )
+
+        return (
+            " ".join(validated_statements)
+            if validated_statements
+            else self._get_fallback_message()
+        )
+
+    def _get_fallback_message(self):
+        """Returns standard fallback message when validation fails."""
+        return "I'm sorry, I couldn't validate the information to answer your question."
+
+    def _process_statement(
+        self,
+        statement,
+        statement_idx,
+        retrieval_results,
+        original_id_to_prompt_id_map,
+        quote_match_threshold,
+        stats,
+    ):
+        """Processes a single statement and its citations."""
+        if not statement.citations:
+            logger.debug(
+                f"Statement {statement_idx} has no citations, considered valid."
+            )
+            return self._format_statement(statement.text, [], statement.linebreaks)
+
+        valid_prompt_ids = self._validate_statement_citations(
+            statement,
+            statement_idx,
+            retrieval_results,
+            original_id_to_prompt_id_map,
+            quote_match_threshold,
+            stats,
+        )
+
+        # Statement is valid if at least one citation is valid
+        if valid_prompt_ids:
+            return self._format_statement(statement.text, valid_prompt_ids, statement.linebreaks)
+
+        logger.warning(
+            f"Statement {statement_idx} is invalid because all citations failed validation."
+        )
+        return None
+
+    def _validate_statement_citations(
+        self,
+        statement,
+        statement_idx,
+        retrieval_results,
+        original_id_to_prompt_id_map,
+        quote_match_threshold,
+        stats,
+    ):
+        """Validates all citations for a statement and returns valid prompt IDs."""
+        valid_prompt_ids = []
+
+        for citation_idx, citation in enumerate(statement.citations):
+            stats["total_checked"] += 1
+
+            # Validate this citation
+            original_id = citation.doc_id
+            is_valid, prompt_id = self._validate_citation(
+                citation,
+                citation_idx,
+                statement_idx,
+                original_id,
+                retrieval_results,
+                original_id_to_prompt_id_map,
+                quote_match_threshold,
+            )
+
+            if is_valid and prompt_id:
+                valid_prompt_ids.append(prompt_id)
+            else:
+                stats["invalid_count"] += 1
+
+        return valid_prompt_ids
+
+    def _validate_citation(
+        self,
+        citation,
+        citation_idx,
+        statement_idx,
+        original_id,
+        retrieval_results,
+        original_id_to_prompt_id_map,
+        quote_match_threshold,
+    ):
+        """Validates an individual citation and returns (is_valid, prompt_id)."""
+        cited_document = self._find_document_by_id(original_id, retrieval_results)
+
+        if not cited_document:
+            logger.warning(
+                f"Validation failed: Document ID '{original_id}' not found for statement {statement_idx}, citation {citation_idx}."
+            )
+            return False, None
+
+        is_quote_valid = self._verify_quote(
+            citation.quote, cited_document.content, threshold=quote_match_threshold
+        )
+
+        if not is_quote_valid:
+            logger.warning(
+                f"Validation failed: Quote not found in doc ID '{original_id}' for statement {statement_idx}, citation {citation_idx}. Quote: '{citation.quote[:100]}...'"
+            )
+            return False, None
+
+        # Citation is valid, get corresponding prompt_id
+        prompt_id = original_id_to_prompt_id_map.get(original_id)
+        if not prompt_id:
+            logger.error(
+                f"Consistency Error: Validated original ID '{original_id}' not found in original_id_to_prompt_id_map for statement {statement_idx}."
+            )
+            return True, None  # Citation is valid but can't find prompt_id
+
+        logger.debug(
+            f"Statement {statement_idx}, citation {citation_idx} (Original ID: {original_id}, Prompt ID: {prompt_id}) validated successfully."
+        )
+        return True, prompt_id
+
+    def _format_statement(self, statement_text, valid_prompt_ids, linebreaks):
+        """Formats a statement with its valid citation markers."""
+        # Remove any old [doc_X] style markers
+        cleaned_text = re.sub(r"\[doc_\d+\]", "", statement_text).strip()
+
+        citations_str = ""
+        if valid_prompt_ids:
+            # Sort prompt IDs naturally and deduplicate
+            sorted_prompt_ids = sorted(
+                list(set(valid_prompt_ids)), key=lambda x: int(x.split("_")[1])
+            )
+            citations_str = " ".join([f"[{pid}]" for pid in sorted_prompt_ids])
+
+        # Validate and convert the linebreaks string to actual newline characters
+        actual_linebreak = ""
+        if linebreaks == "\\n":
+            actual_linebreak = "\n"
+        elif linebreaks == "\\n\\n":
+            actual_linebreak = "\n\n"
+        elif linebreaks != "":
+            # Log a warning if the value is unexpected but non-empty
+            logger.warning(f"Unexpected linebreak value received: {linebreaks!r}. Treating as no linebreak.")
+            actual_linebreak = ""
+        # If linebreaks is "", actual_linebreak remains ""
+
+        # Construct the final string, adding a space before citations only if needed
+        parts = []
+        if cleaned_text:
+            parts.append(cleaned_text)
+        if citations_str:
+            parts.append(citations_str)
+
+        # Join parts with a space and append the actual linebreak character(s)
+        formatted_statement = " ".join(parts) + actual_linebreak
+
+        return formatted_statement
+
+    @log_timing
+    async def structure_and_validate_async(
+        self,
+        plain_answer: str,
+        retrieval_results: QueryResultList,
+        formatted_docs: str,
+        prompt_id_map: Dict[str, str],
+        quote_match_threshold: int = 85,
+    ) -> Tuple[Optional[CitedAnswerResult], Optional[str]]:
+        """
+        Structures the plain answer and validates citations using provided context.
+
+        Returns:
+            Tuple containing:
+            - The structured answer (CitedAnswerResult) with original IDs resolved.
+            - A validated answer string with invalid statements removed and
+              validated citations appended using prompt IDs (e.g., '[doc_1]').
+        """
+        # Input validation
+        if (
+            not plain_answer
+            or not retrieval_results
+            or not retrieval_results.results
+            or not formatted_docs
+            or not prompt_id_map
+        ):
+            logger.warning("Missing required inputs for structuring and validation.")
+            return None, None
+
+        logger.info("Attempting to structure the plain text answer.")
+
+        # Step 1: Structure the plain answer using LLM
+        structured_answer = await self._call_llm(
+            prompt_name="answer_structuring",
+            answer=plain_answer,
+            retrieval_results=formatted_docs,
+            temperature=0.0,
+            response_format=CitedAnswerResult,
+            default_response=None,
+        )
+
+        if structured_answer is None:
+            logger.error("Failed to structure the answer using LLM.")
+            return None, None
+
+        logger.info("Answer structured successfully. Proceeding to validation.")
+
+        # Step 2: Resolve prompt IDs to original IDs within the structured answer object
+        resolved_structured_answer = self._resolve_citation_ids(
+            structured_answer, prompt_id_map
+        )
+
+        # Step 2.5: Create the inverse map: original_id -> prompt_id
+        # Needed to append the correct marker ([doc_X]) after validation
+        original_id_to_prompt_id_map = {v: k for k, v in prompt_id_map.items()}
+
+        # Step 3: Validate citations and build the final validated answer string
+        # Pass both the resolved answer and the inverse map
+        validated_answer = self._validate_citations_and_build_answer(
+            resolved_structured_answer,
+            retrieval_results,
+            original_id_to_prompt_id_map,
+            quote_match_threshold,
+        )
+
+        logger.info("Validation and final answer string construction complete.")
+        # Return the resolved structured answer (still useful potentially) and the final string
+        return resolved_structured_answer, validated_answer
 
 
 class RetrievalEvaluator(BaseProcessor):
@@ -860,13 +1216,13 @@ class RetrievalEvaluator(BaseProcessor):
         self,
         original_query: str,
         clarified_query: str,
-        retrieval_results: List[QueryResult],
+        retrieval_results: QueryResultList,
         router: QueryRouter,
-    ) -> List[QueryResult]:
+    ) -> QueryResultList:
         """Evaluate if retrieval results are sufficient and get additional information if needed."""
-        doc_count = sum(len(r.docs) for r in retrieval_results)
+        doc_count = sum(len(r.docs) for r in retrieval_results.results)
         logger.info(
-            f"Evaluating retrieval results: {doc_count} documents from {len(retrieval_results)} sources"
+            f"Evaluating retrieval results: {doc_count} documents from {len(retrieval_results.results)} sources"
         )
 
         # Skip evaluation if no results
@@ -874,7 +1230,7 @@ class RetrievalEvaluator(BaseProcessor):
             return retrieval_results
 
         # Prepare context from retrieval results
-        context, sources = self._prepare_context(retrieval_results)
+        context, sources = self._prepare_context(retrieval_results.results)
 
         # Use the base class _call_llm method instead of custom _evaluate_with_llm
         evaluation = await self._call_llm(
@@ -891,9 +1247,8 @@ class RetrievalEvaluator(BaseProcessor):
         )
 
         # Process evaluation result
-        enhanced_results = list(
-            retrieval_results
-        )  # Create a copy to avoid modifying the original
+        enhanced_results = retrieval_results  # Create a copy to avoid modifying the original
+
 
         if (
             evaluation
@@ -910,14 +1265,14 @@ class RetrievalEvaluator(BaseProcessor):
             )
 
             if additional_results:
-                enhanced_results.extend(additional_results)
+                enhanced_results.results.extend(additional_results)
                 logger.info(
                     f"Added {len(additional_results)} additional retrieval results"
                 )
         else:
             logger.info("Retrieved information is sufficient or evaluation failed")
 
-        final_doc_count = sum(len(r.docs) for r in enhanced_results)
+        final_doc_count = sum(len(r.docs) for r in enhanced_results.results)
         logger.info(f"Evaluation completed, final document count: {final_doc_count}")
 
         return enhanced_results
@@ -1079,11 +1434,18 @@ class MedicalRAG:
             "parser_service": self.parser_service,
         }
 
+        # Create validator args with a different model
+        validator_args = common_args.copy()
+        validator_args["llm_model"] = (
+            "gpt-4o"  # Using a more capable model for validation
+        )
+
         self.generator = AnswerGenerator(**common_args)
         self.preprocessor = QueryPreprocessor(**common_args)
         self.evaluator = RetrievalEvaluator(**common_args)
         self.context_processor = ConversationContextProcessor(**common_args)
         self.follow_up_generator = FollowUpQuestionsGenerator(**common_args)
+        self.validator = AnswerValidator(**validator_args)
 
         # Initialize conversation history
         self.conversation_history = ConversationHistory(conversation_history_dir)
@@ -1106,28 +1468,19 @@ class MedicalRAG:
     @log_timing
     async def process_query_simple(
         self, user_id: str, user_query: str, use_history: bool = True
-    ) -> CitedAnswerResult:
+    ) -> Tuple[str, List[str]]:
         """
-        Simple method to process a user query and return an answer.
-        Tests all components in the pipeline to ensure prompts work with special characters.
-
-        Args:
-            user_id: Unique identifier for the user
-            user_query: The user's question
-            use_history: Whether to use conversation history
-
-        Returns:
-            CitedAnswerResult with the answer
+        Processes query, returns fast text answer & follow-ups. Validation runs async.
         """
         logger.info(f"Processing query for user '{user_id}': '{user_query}'")
 
         # Get conversation context if needed
         conversation_context = ""
+        history = []
         if use_history:
             history = self.conversation_history.get_history(user_id)
             if history:
                 logger.info(f"Found {len(history)} historical entries for user")
-                # Get relevant context
                 ctx_result = await self.context_processor.extract_relevant_context(
                     user_query, history
                 )
@@ -1136,66 +1489,67 @@ class MedicalRAG:
                     f"Context extraction result: required={ctx_result.required_context}"
                 )
 
-        # # Step 1: Clarify query
-        # clarified = await self.preprocessor.clarify_query_async(
-        #     user_query, conversation_context
-        # )
-        # logger.info(f"Clarification result: level={clarified.ambiguity_level}")
-
-        # # Step 2: Decompose query
-        # decomposed = await self.preprocessor.decompose_query_async(
-        #     clarified.clarified_query
-        # )
-        # logger.info(f"Decomposition result: complexity={decomposed.query_complexity}")
-
-        # # Use decomposed queries if available
-        # queries = (
-        #     decomposed.decomposed_query
-        #     if decomposed.query_complexity == "complex"
-        #     else [clarified.clarified_query]
-        # )
-        
-        #if not queries:
-        queries = [user_query]#[clarified.clarified_query]  # Fallback
-
-        # Step 3: Route queries to retrieve documents
+        queries = [user_query]
         results_list = await asyncio.gather(
             *[self.router.route_query_async(q) for q in queries]
         )
-
-        # Flatten results
-        retrieval_results = QueryResultList(results=list(chain.from_iterable(results_list)),id_map={},formatted_results=None)
-        logger.info(f"Retrieved {len(retrieval_results.results)} results")
-
-        # # Step 4: Evaluate retrieval results
-        # if retrieval_results:
-        #     evaluated_results = await self.evaluator.evaluate_retrieval(
-        #         user_query, user_query, retrieval_results, self.router
-        #     )
-        #     logger.info(
-        #         f"Evaluation completed, final document count: {sum(len(r.docs) for r in evaluated_results)}"
-        #     )
-        # else:
-        #     evaluated_results = []
-
-        # Step 5: Generate answer
-        answer = await self.generator.generate_answer_async(
-            user_query, retrieval_results, conversation_context
+        retrieval_results = QueryResultList(
+            results=list(chain.from_iterable(results_list))
         )
-        logger.info("Answer generated")
-        print(answer.join_statements())
-        # Step 6: Generate follow-up questions
+        current_results = retrieval_results
+
+        generation_result: AnswerGenerationResult = (
+            await self.generator.generate_answer_async(
+                user_question=user_query,
+                retrieval_results=current_results,
+                conversation_context=conversation_context or "",
+            )
+        )
+        logger.info("Plain text answer and context generated.")
+
+        initial_answer = generation_result.plain_answer
+        final_answer = initial_answer  # Default to initial answer
+        print(f"Initial answer: {initial_answer}")
+        if initial_answer != "I'm sorry, I don't know the answer to that question.":
+            # Run structuring and validation
+            logger.info("Starting structuring and validation...")
+            structured_answer, validated_answer = (
+                await self.validator.structure_and_validate_async(
+                    plain_answer=initial_answer,
+                    retrieval_results=generation_result.retrieval_results,
+                    formatted_docs=generation_result.formatted_docs,
+                    prompt_id_map=generation_result.prompt_id_map,
+                )
+            )
+
+            print(f"Validated answer: {validated_answer}")
+            # Use validated answer if available and non-empty
+            if validated_answer:
+                final_answer = validated_answer
+                logger.info("Using validated answer with invalid statements removed.")
+            elif structured_answer is None:
+                logger.warning(
+                    "Structuring failed. Falling back to initial unvalidated answer."
+                )
+                # final_answer remains initial_answer
+            else:
+                logger.warning(
+                    "Validation resulted in an empty answer. Falling back to initial unvalidated answer."
+                )
+                # final_answer remains initial_answer
+        else:
+            logger.info("Skipping structuring/validation due to default error answer.")
+
         follow_ups = await self.follow_up_generator.generate_follow_up_questions(
             user_query,
-            answer.join_statements(),
-            self.conversation_history.get_history(user_id) if use_history else None,
+            final_answer,  # Use the final (potentially validated) answer
+            history if use_history else None,
         )
-        logger.info(f"Generated {len(follow_ups.questions)} follow-up questions")
 
-        # Save to conversation history
-        self.conversation_history.add_entry(user_id, user_query, answer.join_statements())
+        # Save the final (potentially validated) answer to conversation history
+        self.conversation_history.add_entry(user_id, user_query, final_answer)
 
-        return answer
+        return final_answer, follow_ups.questions
 
 
 # Application setup and usage
@@ -1248,7 +1602,6 @@ async def setup_medical_rag() -> MedicalRAG:
 # Example usage
 if __name__ == "__main__":
     # Configure more verbose logging for the example run
-    logging.getLogger().setLevel(logging.DEBUG)
     logger.info("Starting Medical RAG example")
 
     async def main():
@@ -1260,17 +1613,18 @@ if __name__ == "__main__":
         user_id = "test_user"
 
         # Simple test query
-        test_query = "how do these compare to metformin?"
+        test_query = "What is lipitor?"
         logger.info(f"Testing with query: '{test_query}'")
 
         # Process the query and measure time
         start_time = time.time()
-        answer = await medical_rag.process_query_simple(user_id, test_query)
+        answer, follow_ups = await medical_rag.process_query_simple(user_id, test_query)
         elapsed = time.time() - start_time
 
         # Display results
         logger.info(f"Query processed in {elapsed:.2f}s")
         logger.info(f"Answer: {answer}")
+        logger.info(f"Follow-ups: {', '.join(follow_ups)}")
 
         # Close the Weaviate client
         await medical_rag.weaviate_client.close()
