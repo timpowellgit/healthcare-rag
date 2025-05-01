@@ -1,14 +1,16 @@
 # Hybrid RAG Agent with Multi-Stage Answer Validation
 
-This project implements a sophisticated Retrieval-Augmented Generation (RAG) pipeline for answering questions grounded in product monographs (e.g., medications like Lipitor and Metformin). It features intelligent query routing, clarification and decomposition, hybrid document retrieval, speculative answer generation, validation, and follow-up question handling — all orchestrated through agentic logic.
+This project implements a sophisticated Retrieval-Augmented Generation (RAG) system designed to answer questions grounded in healthcare product monographs (e.g., Lipitor, Metformin). It tackles the challenge of providing accurate, grounded answers quickly, even for complex or ambiguous queries, by employing an **asynchronous orchestration strategy with speculative execution**.
 
----
+Instead of a rigid sequential pipeline, the system concurrently explores multiple processing paths. Key capabilities include:
 
-## Project Overview
+*   **Intelligent Query Handling:** Utilizes conversation history for query clarification and decomposes complex questions into simpler sub-queries.
+*   **Targeted Hybrid Retrieval:** Employs OpenAI function calling to route queries to the correct Weaviate vector store (Lipitor or Metformin) and retrieves relevant document chunks using Weaviate's hybrid search (BM25 + OpenAI embeddings with `relativeScoreFusion`).
+*   **Context Enhancement:** Summarizes relevant snippets from conversation history and evaluates retrieval sufficiency, performing gap-filling via additional sub-queries if necessary.
+*   **Validated Answer Synthesis:** Generates a freeform answer incorporating retrieved context and history summary, followed by a rigorous multi-step validation process detailed further below. This validation ensures the final answer is factually grounded in the source documents by checking cited evidence.
+*   **Dialogue Promotion:** Suggests relevant follow-up questions based on the interaction.
 
-The agent processes user questions by first clarifying or decomposing them using conversation history. It then retrieves relevant content using Weaviate's hybrid search (combining sparse and dense methods) after routing the query to the correct document collection (e.g., Lipitor, Metformin) via LLM function-calling. The system evaluates the sufficiency of the retrieved information and performs gap-filling by generating follow-up sub-queries if needed. A grounded answer is generated and subsequently validated against the retrieved documents using a separate, more capable LLM (currently GPT-4o). Finally, it can suggest follow-up questions to encourage dialogue.
-
-The core logic is managed by an orchestrator that handles concurrent processing branches. This enables speculative execution, allowing a direct answer path to run in parallel with query refinement steps like clarification or decomposition.
+This orchestrated approach, powered by technologies like Weaviate, OpenAI, and Docling (for document processing), aims to deliver fast, accurate, and context-aware responses for healthcare information retrieval.
 
 ---
 
@@ -35,57 +37,43 @@ The core logic is managed by an orchestrator that handles concurrent processing 
 The following diagram illustrates a simplified, *conceptual* linear flow, highlighting the sequential dependencies between components if they were executed strictly one after another. This contrasts with the actual concurrent, speculative execution shown in the diagram further below, which aims for faster results when possible.
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ffcc00', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#eee'}}}%%
-flowchart TD
-  %% Inputs
-  Q("User Query"):::queryStyle
-  Summary("History Summary"):::summaryStyle
-  Q --> Summary
+  %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ffcc00', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#eee'}}}%%
+  flowchart TD
+    %% Inputs
+    Q("User Query"):::queryStyle
+    H("Conversation History"):::summaryStyle
 
-  %% Fast path (boxed)
-  subgraph FastPath ["Optimistic Fast Path"]
-    class FastPath fastPathStyle
-    R0{"Retrieval (Initial)"}:::retrievalStyle
-    FA("Fast Answer"):::fastAnswerStyle
-    R0 --> FA
-    Summary --> FA
-    FA --> V{{"Validate Answer"}}:::validateStyle
-  end
+    %% Processing Steps (Strictly Sequential)
+    C{Clarification?}:::clarificationStyle
+    D{Decomposition?}:::decompositionStyle
+    S["History Summary"]:::summaryStyle
+    R["Retrieval (uses refined Q)"]:::retrievalStyle
+    E["Evaluate Retrieval"]:::retrievalStyle
+    A["Answer Generation"]:::gapAnswerStyle
+    V{{"Validate Answer"}}:::validateStyle
+    F("Follow-up Questions"):::queryStyle
 
-  Q --> R0
+    %% Linear Flow (No superseding)
+    Q --> C
+    H --> C
+    C --> D
+    H --> S
+    D --> R
+    S --> A
+    R --> E
+    E --> A
+    A --> V
+    V --> F
 
-  %% Speculative execution
-  Q --> C{Clarification}:::clarificationStyle
-  Q --> D("Decomposition"):::decompositionStyle
-
-  %% Supersede fast path and decomposition
-  C -.->|supersede| R0
-  C -.->|supersede| FA
-  C -.->|supersede| D
-  D -.->|supersede| R0
-  D -.->|supersede| FA
-
-  %% Speculative retrievals
-  C --> RC{"Retrieval (Clarified)"}:::retrievalStyle
-  D --> RS{"Retrieval (Decomposed)"}:::retrievalStyle
-
-  %% Evaluate/Augment results before final answer/validation
-  RC --> G1("Evaluate & Augment Results"):::gapAnswerStyle
-  RS --> G2("Evaluate & Augment Results"):::gapAnswerStyle
-  Summary --> G1
-  Summary --> G2
-  G1 --> V
-  G2 --> V
-
-  %% Styles
-  classDef queryStyle fill:#a3c9a8,stroke:#000,stroke-width:2px;
-  classDef summaryStyle fill:#fff2cc,stroke:#000,stroke-width:2px;
-  classDef retrievalStyle fill:#f4cccc,stroke:#000,stroke-width:1px;
-  classDef validateStyle fill:#d9ead3,stroke:#000,stroke-width:2px;
-  classDef clarificationStyle fill:#f6b26b,stroke:#000,stroke-width:1px;
-  classDef decompositionStyle fill:#b4a7d6,stroke:#000,stroke-width:2px;
-  classDef gapAnswerStyle fill:#ffe599,stroke:#000,stroke-width:2px;
-```
+    %% Styles
+    classDef queryStyle fill:#a3c9a8,stroke:#000,stroke-width:2px;
+    classDef summaryStyle fill:#fff2cc,stroke:#000,stroke-width:2px;
+    classDef retrievalStyle fill:#f4cccc,stroke:#000,stroke-width:1px;
+    classDef validateStyle fill:#d9ead3,stroke:#000,stroke-width:2px;
+    classDef clarificationStyle fill:#f6b26b,stroke:#000,stroke-width:1px;
+    classDef decompositionStyle fill:#b4a7d6,stroke:#000,stroke-width:2px;
+    classDef gapAnswerStyle fill:#ffe599,stroke:#000,stroke-width:2px;
+  ```
 
 ---
 
@@ -163,18 +151,31 @@ flowchart TD
 
 ## Retrieval Engine Details
 
-**Weaviate Hybrid Retrieval:** Document chunks are indexed in Weaviate collections (e.g., `Lipitor`, `Metformin`). Each chunk includes a dense vector, a sparse vector representation (for keyword matching), and metadata like source and page numbers. Queries use Weaviate's `hybrid` function with Relative Score Fusion. An LLM function call selects the target collection(s).
+**Weaviate Hybrid Retrieval:** Document chunks are indexed in Weaviate collections (e.g., `Lipitor`, `Metformin`). Each chunk includes:
+*   An OpenAI embedding vector (dense vector) used for semantic search, compared using cosine similarity.
+*   Preparation for Weaviate's sparse keyword indexing via **BM25**. BM25 calculates relevance by considering both the frequency of query terms within a chunk (**Term Frequency**) and how unique those terms are across the entire dataset (**Inverse Document Frequency**). It also includes parameters to **normalize for document length**, preventing longer chunks from having an unfair advantage simply due to size. This results in higher scores for chunks where query terms appear relatively often and are distinctive across the corpus.
+*   Associated metadata (source, page numbers, etc.).
 
+Queries utilize Weaviate's `hybrid` search function, specifically configured with:
+*   **Fusion Strategy:** `relativeScoreFusion`. This method prepares the scores from the vector search and keyword search for combination. It independently normalizes each set of scores using a min-max scaling approach: within each result set (vector or keyword), the highest score is mapped to 1, the lowest score is mapped to 0, and all other scores are scaled proportionally in between. These normalized scores (ranging from 0 to 1) are then combined based on the alpha parameter. As highlighted in Weaviate's documentation, this approach preserves more information about the relative differences between scores compared to the older rank-based `rankedFusion` method.
+*   **Alpha Parameter:** Set to `0.65`. This gives slightly more weight to the vector search results (semantic similarity) compared to the keyword search results (exact matches) in the final ranking.
+
+The system utilizes OpenAI's function calling capability to route the query to the appropriate Weaviate collection(s). Predefined function descriptions, one for each collection (e.g., "query_lipitor", "query_metformin"), are provided to the LLM along with the user query. The LLM analyzes the query and selects the relevant function(s) to call, thereby determining which specific collection(s) (Lipitor or Metformin) should be targeted for the subsequent hybrid search.
 
 ---
 
 ## Document Processing & Indexing
 
-**Chunking with Docling:** The source PDFs (`docs/lipitor.pdf`, `docs/metformin.pdf`) are parsed and chunked using the `docling` library, specifically `docling.HybridChunker`, which considers document structure.
+Raw PDF documents (`docs/lipitor.pdf`, etc.) are processed into indexed chunks suitable for retrieval through the following steps:
 
-**Post-Processing Adjustments:** Custom logic merges table fragments that might span multiple raw chunks and rejoins sentence fragments that were split under the same heading during the initial chunking.
+1.  **Hybrid Chunking (Docling):** The `docling` library parses PDFs, identifying structural elements (headers, tables, etc.). Its `HybridChunker` leverages this structure for initial hierarchical chunking. It then refines these chunks based on an embedding model's tokenizer, splitting oversized chunks and merging undersized consecutive chunks that share the same structural context (e.g., same heading) to balance semantic coherence and token limits.
 
-**Embedding & Indexing:** The `contextualized` text for each chunk (output by Docling) is indexed in Weaviate. The ingestion script (`src/weaviate_ingest.py`, *assumed*) likely handles dense vector generation and prepares data for Weaviate's sparse indexing. Metadata is stored alongside the content.
+2.  **Contextualization:** Crucially, `docling` preserves structural metadata (headers, captions) with each chunk. This "contextualized" text, enriched with its location and role, improves the quality and relevance of the resulting vector embeddings.
+
+3.  **Custom Post-Processing:** Additional logic addresses PDF parsing artifacts:
+    *   Rejoins sentence fragments split across chunk boundaries.
+    *   Merges fragmented table chunks often caused by page breaks.
+
 
 ---
 
