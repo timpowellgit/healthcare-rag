@@ -19,18 +19,19 @@ This orchestrated approach, powered by technologies like Weaviate, OpenAI, and D
 **Clarification & Decomposition:**
 *   **Clarification:** Uses conversation history to interpret follow-up questions containing ambiguous references (like pronouns) that depend on previous turns in the dialogue.
 *   **Decomposition:** Breaks down complex questions into multiple, focused sub-queries specifically for retrieval. This process operates independently of conversation history.
+*(Query refinement logic handled by `QueryPreprocessor`)*
 
-**Conversation Context Summarization:** Before generating an answer, this component analyzes the current user query and the preceding conversation history. It identifies and extracts key snippets from the history that are relevant for providing context or answering the current question. This summary is then passed along to the answer generation step.
+**Conversation Context Summarization:** Before generating an answer, this component analyzes the current user query and the preceding conversation history. It identifies and extracts key snippets from the history that are relevant for providing context or answering the current question. This summary is then passed along to the answer generation step. *(Handled by `ConversationContextProcessor`)*
 
-**Document Retrieval (Weaviate Hybrid RAG):** An LLM function call first analyzes the user query to determine the relevant medication, routing the request to the specific Weaviate vector store for either "Lipitor" or "Metformin". The system then retrieves relevant **document chunks** using Weaviate's hybrid search capabilities. The specifics of this hybrid search (combining dense and sparse methods with Relative Score Fusion) are detailed in the "Retrieval Engine Details" section below.
+**Document Retrieval (Weaviate Hybrid RAG):** An LLM function call first analyzes the user query to determine the relevant medication, routing the request to the specific Weaviate vector store for either "Lipitor" or "Metformin" *(routing via `QueryRouter`)*. The system then retrieves relevant **document chunks** using Weaviate's hybrid search capabilities *(search performed by `QueryRouter`)*. The specifics of this hybrid search (combining dense and sparse methods with Relative Score Fusion) are detailed in the "Retrieval Engine Details" section below.
 
-**Retrieval Evaluation & Gap-Filling:** After the initial retrieval, this component assesses whether the collected document chunks contain sufficient information to answer the user's query thoroughly. If the initial context is deemed insufficient, the evaluator generates new, targeted sub-queries to fetch additional relevant document chunks. This augmented set of chunks is then passed on for answer generation.
+**Retrieval Evaluation & Gap-Filling:** After the initial retrieval, this component assesses whether the collected document chunks contain sufficient information to answer the user's query thoroughly. If the initial context is deemed insufficient, the evaluator generates new, targeted sub-queries to fetch additional relevant document chunks. This augmented set of chunks is then passed on for answer generation. *(Performed by `RetrievalEvaluator`)*
 
-**Answer Generation:** This component receives the user query (potentially clarified or decomposed) and the final set of retrieved document chunks (potentially augmented by gap-filling). Using this context,and the summarized history, an LLM generates a freeform answer, aiming to include citations pointing back to the source documents.
+**Answer Generation:** This component receives the user query (potentially clarified or decomposed) and the final set of retrieved document chunks (potentially augmented by gap-filling). Using this context, an LLM generates a freeform answer, aiming to include citations pointing back to the source documents. *(Core generation logic in `AnswerGenerator`)*
 
-**Answer Validation:** The initial freeform answer undergoes a rigorous validation process to check for factual grounding and handle potential hallucinations. See the "Detailed Answer Validation and Hallucination Handling" section below for specifics.
+**Answer Validation:** The initial freeform answer undergoes a rigorous validation process to check for factual grounding and handle potential hallucinations. See the "Detailed Answer Validation and Hallucination Handling" section below for specifics. *(Validation initiated via `AnswerValidator`)*
 
-**Follow-Up Question Generation:** Based on the final answer and conversation context, the system can also generate relevant follow-up questions to guide the user or explore related topics.
+**Follow-Up Question Generation:** Based on the final answer and conversation context, the system can also generate relevant follow-up questions to guide the user or explore related topics. *(Handled by `FollowUpQuestionsGenerator`)*
 
 **Conceptual Data Flow:**
 
@@ -157,7 +158,7 @@ flowchart TD
 *   Associated metadata (source, page numbers, etc.).
 
 Queries utilize Weaviate's `hybrid` search function, specifically configured with:
-*   **Fusion Strategy:** `relativeScoreFusion`. This method prepares the scores from the vector search and keyword search for combination. It independently normalizes each set of scores using a min-max scaling approach: within each result set (vector or keyword), the highest score is mapped to 1, the lowest score is mapped to 0, and all other scores are scaled proportionally in between. These normalized scores (ranging from 0 to 1) are then combined based on the alpha parameter. As highlighted in Weaviate's documentation, this approach preserves more information about the relative differences between scores compared to the older rank-based `rankedFusion` method.
+*   **Fusion Strategy:** `relativeScoreFusion`. This method prepares the scores from the vector search and keyword search for combination. It independently normalizes each set of scores using a min-max scaling approach: within each result set (vector or keyword), the highest score is mapped to 1, the lowest score is mapped to 0, and all other scores are scaled proportionally in between. These normalized scores (ranging from 0 to 1) are then combined based on the alpha parameter. This approach preserves more information about the relative differences between scores compared to the older rank-based `rankedFusion` method.
 *   **Alpha Parameter:** Set to `0.65`. This gives slightly more weight to the vector search results (semantic similarity) compared to the keyword search results (exact matches) in the final ranking.
 
 The system utilizes OpenAI's function calling capability to route the query to the appropriate Weaviate collection(s). Predefined function descriptions, one for each collection (e.g., "query_lipitor", "query_metformin"), are provided to the LLM along with the user query. The LLM analyzes the query and selects the relevant function(s) to call, thereby determining which specific collection(s) (Lipitor or Metformin) should be targeted for the subsequent hybrid search.
@@ -209,11 +210,11 @@ Consider the query "What are the side effects of Lipitor?". The orchestrator ini
 
 ## Detailed Answer Validation and Hallucination Handling
 
-To ensure the generated answers are factually grounded in the provided documents and to mitigate hallucinations, the system employs a multi-step validation process after the initial answer generation:
+To ensure the generated answers are factually grounded in the provided documents and to mitigate hallucinations, the system *(primarily via the `AnswerValidator` class, often invoked as the `validate_answer` task in the orchestrator)* employs a multi-step validation process after the initial answer generation:
 
-1.  **Initial Generation with Attempted Citations:** The first step involves an LLM generating a freeform answer based on the query, retrieved document chunks, and conversation context. This generation prompt encourages the LLM to include citations referencing the source documents.
+1.  **Initial Generation with Attempted Citations:** The first step involves an LLM generating a freeform answer *(via `AnswerGenerator`)* based on the query, retrieved document chunks, and conversation context. This generation prompt encourages the LLM to include citations referencing the source documents.
 
-2.  **Structured Parsing:** The raw, freeform answer (with attempted citations) is then processed using a structured output method (e.g., an LLM call constrained by a specific format or using a tool like Pydantic). This converts the answer into a structured list of individual "statement" objects.
+2.  **Structured Parsing:** The raw, freeform answer (with attempted citations) is then processed using a structured output method (e.g., an LLM call constrained by a specific format or using a tool like Pydantic). This converts the answer into a structured list of individual "statement" objects. *(Parsing logic within `AnswerValidator`)*
 
 3.  **Statement & Citation Objects:** Each statement object in the list typically contains:
     *   The text of the individual claim or statement being made.
@@ -222,11 +223,11 @@ To ensure the generated answers are factually grounded in the provided documents
     *   An identifier for the specific document chunk referenced.
     *   The exact quote from that document chunk which supposedly supports the statement.
 
-4.  **Quote Verification Loop:** A validation function iterates through each structured statement object. For each statement, it performs a check:
+4.  **Quote Verification Loop:** A validation function *(within `AnswerValidator`)* iterates through each structured statement object. For each statement, it performs a check:
     *   It retrieves the content of the document chunk referenced in the citation object.
     *   It verifies if the quote provided in the citation object can be found within that document chunk's content using **fuzzy matching**. This allows for minor variations and doesn't require an exact string match, succeeding if the match score exceeds a predefined threshold.
 
-5.  **Statement Filtering:** If the quote verification fails for a statement (i.e., the provided quote is not found in the referenced document chunk, indicating a potential hallucination or mis-citation), that specific statement may be removed from the list.
+5.  **Statement Filtering:** If the quote verification fails for a statement (i.e., the provided quote is not found in the referenced document chunk, indicating a potential hallucination or mis-citation), that specific statement may be removed from the list. *(Filtering logic within `AnswerValidator`)*
 
 6.  **Final Validated Output:** The final output consists of the remaining, verified statements, ensuring that the answer presented to the user is directly supported by evidence found within the source documents.
 
