@@ -33,6 +33,8 @@ This orchestrated approach, powered by technologies like Weaviate, OpenAI, and D
 
 **Follow-Up Question Generation:** Based on the final answer and conversation context, the system can also generate relevant follow-up questions to guide the user or explore related topics. *(Handled by `FollowUpQuestionsGenerator`)*
 
+**Prompt Management (Jinja2 Templates):** LLM interactions for various tasks (clarification, decomposition, evaluation, generation, validation, follow-ups) are driven by prompts defined in external template files located in the `prompts/` directory. These files use the Jinja2 templating engine, allowing for dynamic prompt construction based on runtime data.  *(Managed by the `PromptManager` class)*
+
 **Conceptual Data Flow:**
 
 The following diagram illustrates a simplified, *conceptual* linear flow, highlighting the sequential dependencies between components if they were executed strictly one after another. This contrasts with the actual concurrent, speculative execution shown in the diagram further below, which aims for faster results when possible.
@@ -165,37 +167,58 @@ The system utilizes OpenAI's function calling capability to route the query to t
 
 ---
 
-## Document Processing & Indexing
-
-Raw PDF documents (`docs/lipitor.pdf`, etc.) are processed into indexed chunks suitable for retrieval through the following steps:
-
-1.  **Hybrid Chunking (Docling):** The `docling` library parses PDFs, identifying structural elements (headers, tables, etc.). Its `HybridChunker` leverages this structure for initial hierarchical chunking. It then refines these chunks based on an embedding model's tokenizer, splitting oversized chunks and merging undersized consecutive chunks that share the same structural context (e.g., same heading) to balance semantic coherence and token limits.
-
-2.  **Contextualization:** Crucially, `docling` preserves structural metadata (headers, captions) with each chunk. This "contextualized" text, enriched with its location and role, improves the quality and relevance of the resulting vector embeddings.
-
-3.  **Custom Post-Processing:** Additional logic addresses PDF parsing artifacts:
-    *   Rejoins sentence fragments split across chunk boundaries.
-    *   Merges fragmented table chunks often caused by page breaks.
-
-
----
-
 ## Setup & Execution
 
-**Requirements:**
+Follow these steps to set up the environment and run the agent.
+
+**1. Requirements:**
 *   Python 3.9+
 *   Docker & Docker Compose (for Weaviate)
-*   OpenAI API Key (set in a `.env` file: `OPENAI_API_KEY="your_key"`)
-*   Python dependencies (install via `pip install -r requirements.txt` after populating the file - see TODO within).
+*   **Set up Environment Variables:** Create a file named `.env` in the project root by copying the template file `.env.example`. Edit the `.env` file to add your actual `OPENAI_APIKEY`. The `.env` file is ignored by Git and should contain your secrets.
+    ```bash
+    cp .env.example .env
+    # Now edit .env to add your key
+    ```
+    *(The application will automatically load variables from the `.env` file if it exists. You only need to uncomment and set the `WEAVIATE_...` variables in `.env` if your local Weaviate instance deviates from the standard `127.0.0.1:8080 / 50051` setup).*
+*   Install Python dependencies from the populated `requirements.txt`:
+    ```bash
+    source .venv/bin/activate # Activate your virtual environment first!
+    pip install -r requirements.txt
+    ```
 
-**Prepare Documents & Index Data:**
-
-**Start Weaviate:**
+**2. Start Weaviate:**
+Use Docker Compose to start the Weaviate vector database service defined in `docker-compose.yml`. This needs to be running before data ingestion.
 ```bash
 docker compose up -d
 ```
 
-**Run Agent (Interactive CLI):**
+**3. Data Preparation:**
+
+This involves chunking the source PDFs and ingesting the chunks into the running Weaviate instance.
+
+*   **a) Chunking PDFs:** Process the source PDF documents using `healthcare_rag/processors/pdf_chunker.py`. This script leverages the `docling` library to parse the PDFs, perform hybrid chunking, apply custom post-processing (sentence/table merging), and save the results as JSON files in the `data/` directory (e.g., `data/chunks_lipitor.json`).
+    ```bash
+    # Process Lipitor document
+    python healthcare_rag/processors/pdf_chunker.py --source docs/lipitor.pdf
+
+    # Process Metformin document
+    python healthcare_rag/processors/pdf_chunker.py --source docs/metformin.pdf
+    ```
+
+*   **b) Ingesting into Weaviate:** Load the generated JSON chunks into Weaviate using `healthcare_rag/storage/vector_store.py`. This script connects to Weaviate (which must be running from Step 2), creates the `Lipitor` and `Metformin` collections with the required schema (including OpenAI vectorizer), and imports the chunk data in batches.
+    ```bash
+    # Ensure Weaviate is running (Step 2)
+    # Ensure OPENAI_APIKEY is set in your .env file
+
+    # To ingest both documents into their respective collections:
+    python healthcare_rag/storage/vector_store.py --collection Lipitor data/chunks_lipitor.json --collection Metformin data/chunks_metformin.json
+
+    # Optional: Use --delete-all to clear *all* existing Weaviate collections before ingesting
+    # python healthcare_rag/storage/vector_store.py --delete-all --collection Lipitor data/chunks_lipitor.json --collection Metformin data/chunks_metformin.json
+    ```
+
+**4. Run Agent (Interactive CLI):**
+Execute the main application package to start the interactive command-line interface.
 ```bash
 python -m healthcare_rag
 ```
