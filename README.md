@@ -38,33 +38,46 @@ The following diagram illustrates a simplified, *conceptual* linear flow, highli
 %%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ffcc00', 'edgeLabelBackground':'#ffffff', 'tertiaryColor': '#eee'}}}%%
 flowchart TD
   %% Inputs
-  Q(("User Query")):::queryStyle
-  H(("Conversation History")):::summaryStyle
+  Q("User Query"):::queryStyle
+  Summary("History Summary"):::summaryStyle
+  Q --> Summary
 
-  %% Processing Steps (Strictly Sequential)
-  C{Clarification?}:::clarificationStyle
-  D{Decomposition?}:::decompositionStyle
-  S["History Summary"]:::summaryStyle
-  R["Retrieval (uses refined Q)"]:::retrievalStyle
-  E["Evaluate Retrieval"]:::retrievalStyle
-  A["Answer Generation"]:::gapAnswerStyle
-  V{{"Validate Answer"}}:::validateStyle
-  F(("Follow-up Questions")):::queryStyle
+  %% Fast path (boxed)
+  subgraph FastPath ["Optimistic Fast Path"]
+    class FastPath fastPathStyle
+    R0{"Retrieval (Initial)"}:::retrievalStyle
+    FA("Fast Answer"):::fastAnswerStyle
+    R0 --> FA
+    Summary --> FA
+    FA --> V{{"Validate Answer"}}:::validateStyle
+  end
 
-  %% Linear Flow
-  Q --> C
-  H --> C
-  C --> D
-  D --> S
-  H --> S
-  D --> R
-  S --> A
-  R --> E
-  E --> A
-  A --> V
-  V --> F
+  Q --> R0
 
-  %% Styles (copied from other diagram)
+  %% Speculative execution
+  Q --> C{Clarification}:::clarificationStyle
+  Q --> D("Decomposition"):::decompositionStyle
+
+  %% Supersede fast path and decomposition
+  C -.->|supersede| R0
+  C -.->|supersede| FA
+  C -.->|supersede| D
+  D -.->|supersede| R0
+  D -.->|supersede| FA
+
+  %% Speculative retrievals
+  C --> RC{"Retrieval (Clarified)"}:::retrievalStyle
+  D --> RS{"Retrieval (Decomposed)"}:::retrievalStyle
+
+  %% Evaluate/Augment results before final answer/validation
+  RC --> G1("Evaluate & Augment Results"):::gapAnswerStyle
+  RS --> G2("Evaluate & Augment Results"):::gapAnswerStyle
+  Summary --> G1
+  Summary --> G2
+  G1 --> V
+  G2 --> V
+
+  %% Styles
   classDef queryStyle fill:#a3c9a8,stroke:#000,stroke-width:2px;
   classDef summaryStyle fill:#fff2cc,stroke:#000,stroke-width:2px;
   classDef retrievalStyle fill:#f4cccc,stroke:#000,stroke-width:1px;
