@@ -1,4 +1,5 @@
-# Hybrid RAG Agent with Multi-Stage Answer Validation
+# Hybrid RAG Agent with Answer Validation
+[![Python Version](https://img.shields.io/badge/Python-3.9+-blue.svg)](https://www.python.org/downloads/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![GitHub last commit](https://img.shields.io/github/last-commit/timpowellgit/healthcare-rag)](https://github.com/timpowellgit/healthcare-rag/commits)
 
 This project implements a sophisticated Retrieval-Augmented Generation (RAG) system designed to answer questions grounded in healthcare product monographs (e.g., Lipitor, Metformin). It tackles the challenge of providing accurate, grounded answers quickly, even for complex or ambiguous queries, by employing an **asynchronous orchestration strategy with speculative execution**.
 
@@ -11,6 +12,15 @@ Instead of a rigid sequential pipeline, the system concurrently explores multipl
 *   **Dialogue Promotion:** Suggests relevant follow-up questions based on the interaction.
 
 This orchestrated approach, powered by technologies like Weaviate, OpenAI, and Docling (for document processing), aims to deliver fast, accurate, and context-aware responses for healthcare information retrieval.
+
+## Table of Contents
+- [Core Pipeline Components](#core-pipeline-components)
+- [Technology Stack](#technology-stack)
+- [Speculative Execution & Orchestration](#speculative-execution--orchestration)
+- [Retrieval Engine Details](#retrieval-engine-details)
+- [Setup & Execution](#setup--execution)
+- [Example Query Flow](#example-query-flow)
+- [Detailed Answer Validation and Hallucination Handling](#detailed-answer-validation-and-hallucination-handling)
 
 ---
 
@@ -77,6 +87,19 @@ The following diagram illustrates a simplified, *conceptual* linear flow, highli
     classDef decompositionStyle fill:#b4a7d6,stroke:#000,stroke-width:2px;
     classDef gapAnswerStyle fill:#ffe599,stroke:#000,stroke-width:2px;
   ```
+
+## Technology Stack
+
+This project utilizes the following core technologies:
+
+*   [![Python](https://img.shields.io/badge/Python-3.9+-blue?logo=python&logoColor=white)](https://www.python.org/) - Core programming language.
+*   [![Weaviate](https://img.shields.io/badge/Weaviate-Vector_Database-green?logo=weaviate&logoColor=white)](https://weaviate.io/) - Vector database for hybrid search.
+*   [![OpenAI](https://img.shields.io/badge/OpenAI-LLMs_&_Embeddings-412991?logo=openai&logoColor=white)](https://openai.com/) - Language models for generation, embeddings, and function calling.
+*   [![Docker](https://img.shields.io/badge/Docker-Containerization-2496ED?logo=docker&logoColor=white)](https://www.docker.com/) - Used via Docker Compose for running Weaviate.
+*   [![Jinja2](https://img.shields.io/badge/Jinja2-Templating-B41717?logo=jinja&logoColor=white)](https://jinja.palletsprojects.com/) - For managing LLM prompts.
+*   Docling - Python library for document parsing and chunking (especially PDFs).
+*   Pydantic - For data validation, particularly in structuring LLM outputs.
+*   [![Mermaid](https://img.shields.io/badge/Mermaid-Diagrams-007F7F?logo=mermaid&logoColor=white)](https://mermaid.js.org/) - Used for rendering diagrams in this README.
 
 ---
 
@@ -229,6 +252,7 @@ python -m healthcare_rag
 
 Consider the query "What are the side effects of Lipitor?". The orchestrator initiates concurrent tasks: summarizing history, clarifying, decomposing, and retrieving based on the original query. Assuming the query is clear and simple, clarification and decomposition branches won't proceed far. History is summarized. An LLM routes the query to the `Lipitor` collection using a function call. Weaviate performs hybrid retrieval. The results are evaluated; if sufficient, answer generation proceeds using the retrieved context and history summary. A validation LLM checks the answer against the sources. Follow-up questions might be generated. The final validated answer and suggestions are returned. If the initial retrieval was insufficient, the evaluation step would trigger gap-filling sub-queries before answer generation.
 
+
 ---
 
 ## Detailed Answer Validation and Hallucination Handling
@@ -253,5 +277,9 @@ To ensure the generated answers are factually grounded in the provided documents
 5.  **Statement Filtering:** If the quote verification fails for a statement (i.e., the provided quote is not found in the referenced document chunk, indicating a potential hallucination or mis-citation), that specific statement may be removed from the list. *(Filtering logic within `AnswerValidator`)*
 
 6.  **Final Validated Output:** The final output consists of the remaining, verified statements, ensuring that the answer presented to the user is directly supported by evidence found within the source documents.
+
+## Contact
+
+For questions or support, please contact Tim Powell at [timpowelldk@gmail.com](mailto:timpowelldk@gmail.com).
 
 ---
