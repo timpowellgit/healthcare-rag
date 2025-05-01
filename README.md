@@ -98,7 +98,7 @@ This project utilizes the following core technologies:
 *   [![Docker](https://img.shields.io/badge/Docker-Containerization-2496ED?logo=docker&logoColor=white)](https://www.docker.com/) - Used via Docker Compose for running Weaviate.
 *   [![Jinja2](https://img.shields.io/badge/Jinja2-Templating-B41717?logo=jinja&logoColor=white)](https://jinja.palletsprojects.com/) - For managing LLM prompts.
 *   Docling - Python library for document parsing and chunking (especially PDFs).
-*   Pydantic - For data validation, particularly in structuring LLM outputs.
+*   [![Pydantic](https://img.shields.io/badge/Pydantic-v2.11.3-blue?logo=pydantic&logoColor=white)](https://docs.pydantic.dev/latest/) - For data validation, particularly in structuring LLM outputs.
 *   [![Mermaid](https://img.shields.io/badge/Mermaid-Diagrams-007F7F?logo=mermaid&logoColor=white)](https://mermaid.js.org/) - Used for rendering diagrams in this README.
 
 ---
@@ -281,5 +281,7 @@ To ensure the generated answers are factually grounded in the provided documents
 ## Contact
 
 For questions or support, please contact Tim Powell at [timpowelldk@gmail.com](mailto:timpowelldk@gmail.com).
+
+You can also find me on: [![LinkedIn](https://img.shields.io/badge/LinkedIn-Profile-blue?style=flat&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/tim-powell-64790b132/)
 
 ---
