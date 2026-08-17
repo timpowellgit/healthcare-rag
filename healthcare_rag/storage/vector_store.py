@@ -8,7 +8,7 @@ This module provides functions to:
 - Import data into specified collections in batches.
 
 Required Environment Variables:
-- OPENAI_APIKEY: Your OpenAI API key for the text2vec-openai vectorizer.
+- OPENAI_API_KEY: Your OpenAI API key for the text2vec-openai vectorizer.
 """
 
 import weaviate
@@ -67,13 +67,13 @@ def connect_to_weaviate(
         An initialized WeaviateClient instance.
 
     Raises:
-        ValueError: If the OPENAI_APIKEY environment variable is not set.
+        ValueError: If the OPENAI_API_KEY environment variable is not set.
         weaviate.exceptions.WeaviateStartUpError: If the connection fails.
     """
-    openai_key = os.getenv("OPENAI_APIKEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
-        logging.error("OPENAI_APIKEY environment variable not set.")
-        raise ValueError("OPENAI_APIKEY environment variable not set.")
+        logging.error("OPENAI_API_KEY environment variable not set.")
+        raise ValueError("OPENAI_API_KEY environment variable not set.")
 
     headers: Dict[str, str] = {"X-OpenAI-Api-Key": openai_key}
 
@@ -131,7 +131,6 @@ def create_collection(
             collection_name,
             vectorizer_config=Configure.Vectorizer.text2vec_openai(),
             properties=properties,
-            reranker_config=Configure.Reranker.cohere(),  # Ensure you have COHERE_APIKEY env var if using this
         )
         logging.info(f"Collection '{collection_name}' created successfully.")
         return client.collections.get(collection_name)

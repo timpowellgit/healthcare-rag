@@ -3,10 +3,15 @@ import logging
 import openai
 from typing import List, Optional, Dict, Any, cast
 
+from dotenv import load_dotenv
 from weaviate.client import WeaviateAsyncClient
 from weaviate.connect import ConnectionParams
 
 from .pipeline.medical_rag import MedicalRAG
+
+# Load .env at import time so both this module and the OpenAI SDK (which
+# reads OPENAI_API_KEY directly) pick up local development credentials.
+load_dotenv()
 
 logger = logging.getLogger("MedicalRAG")
 
@@ -48,14 +53,14 @@ async def setup_medical_rag(
         weaviate_port: HTTP port for Weaviate (defaults to env var WEAVIATE_PORT or 8080)
         weaviate_grpc_port: gRPC port for Weaviate (defaults to env var WEAVIATE_GRPC_PORT or 50051)
         collection_names: Names of collections to query (defaults to ["Lipitor", "Metformin"])
-        openai_key: OpenAI API key (defaults to env var OPENAI_APIKEY)
+        openai_key: OpenAI API key (defaults to env var OPENAI_API_KEY)
         use_secure_connection: Whether to use HTTPS/secure gRPC
-        
+
     Returns:
         A configured MedicalRAG instance ready to use
-        
+
     Raises:
-        ValueError: If openai_key is not provided and OPENAI_APIKEY env var is not set
+        ValueError: If openai_key is not provided and OPENAI_API_KEY env var is not set
     """
     # Define default Weaviate connection parameters from env vars or provided args
     host = weaviate_host or get_env_var("WEAVIATE_HOST", "127.0.0.1")
@@ -67,7 +72,7 @@ async def setup_medical_rag(
     grpc_port = int(grpc_port_str)
 
     # Get OpenAI API key
-    api_key = openai_key or get_env_var("OPENAI_APIKEY", required=True)
+    api_key = openai_key or get_env_var("OPENAI_API_KEY", required=True)
 
     # Set up headers for OpenAI
     headers = {"X-OpenAI-Api-Key": api_key}
